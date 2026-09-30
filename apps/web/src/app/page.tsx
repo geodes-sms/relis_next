@@ -1,13 +1,14 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { publicConfig } from "@/shared/lib/config";
 
 type ApiStatus =
   | { state: "loading" }
   | { state: "connected"; message: string }
   | { state: "error"; message: string };
 
-const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001";
+const apiUrl = publicConfig.NEXT_PUBLIC_API_URL;
 
 export default function Home() {
   const [apiStatus, setApiStatus] = useState<ApiStatus>({

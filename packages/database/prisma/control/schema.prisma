@@ -1,0 +1,8 @@
+// Control-plane database schema. No models are defined yet: no
+// control-plane domain has been authorized for implementation. This
+// schema exists only so the Prisma CLI has a valid target for the
+// migration entry point (packages/database/src/migrate.ts) to validate
+// configuration against and invoke `prisma migrate deploy` on.
+datasource db {
+  provider = "postgresql"
+}

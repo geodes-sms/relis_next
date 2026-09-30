@@ -1,24 +1,32 @@
 {
-  "name": "@relis/worker",
+  "name": "@relis/config",
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./public": {
+      "types": "./dist/public.d.ts",
+      "default": "./dist/public.js"
+    }
+  },
+  "bin": {
+    "relis-config": "./dist/cli.js"
+  },
   "scripts": {
-    "dev": "tsx watch src/main.ts",
-    "build": "pnpm --filter @relis/config build && tsc",
-    "start": "node dist/main.js",
+    "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
-    "@relis/config": "workspace:*",
     "dotenv": "^17.4.2",
-    "pg-boss": "^12.26.3",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
-    "tsx": "^4.23.1",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
   }
