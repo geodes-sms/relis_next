@@ -4,14 +4,23 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "pnpm --parallel --filter './apps/*' dev",
+    "dev": "pnpm --filter @relis/config build && node packages/config/dist/cli.js check-ports && pnpm --parallel --filter './apps/*' dev",
     "build": "pnpm -r build",
     "lint": "pnpm -r lint",
-    "typecheck": "pnpm -r typecheck",
-    "test": "pnpm -r test"
+    "typecheck": "pnpm -r typecheck && pnpm run typecheck:tests",
+    "typecheck:tests": "pnpm --filter @relis/config build && tsc --noEmit -p tsconfig.tests.json",
+    "test": "pnpm -r test && pnpm run test:integration",
+    "test:integration": "vitest run --config vitest.integration.config.ts"
   },
   "packageManager": "pnpm@11.17.0",
   "engines": {
     "node": ">=22.15"
+  },
+  "devDependencies": {
+    "@relis/config": "workspace:*",
+    "@relis/test-utils": "workspace:*",
+    "@types/node": "^26.1.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
   }
 }
