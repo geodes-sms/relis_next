@@ -1,0 +1,282 @@
+# Local Docker Compose stack for ReLiS — ONE documented startup command
+# for the seven service responsibilities required by this sub-issue (see
+# docs/architecture/docker-compose-stack.md for prerequisites, endpoints,
+# shutdown, and honest limitations; docs/architecture/local-stack-inventory.md
+# for the application startup contracts this stack reuses unchanged):
+#
+#   1. apps/web   (Next.js, existing `dev` command)
+#   2. apps/api   (Hono, existing `dev` command)
+#   3. apps/worker (existing `dev` command — tsx watch; logs and stays
+#      alive, does NOT process jobs — see worker/worker-related comments
+#      below and the inventory doc §3.3/§7)
+#   4. postgres   (one server, two disposable databases: Control DB +
+#      project-test target — provisioned via migrate-control/migrate-project)
+#   5. nginx      (the only published entry point for web + API)
+#   6. storage    (SeaweedFS, S3-compatible endpoint — no application
+#      adapter exists yet; this provisions the infrastructure only)
+#   7. mailhog    (local mail capture — prescribed by
+#      context/project-structure.md's docker/mailhog/ entry; no
+#      application mail adapter exists yet either)
+#
+# This stack is local-development only: no production target, no TLS, no
+# CI wiring, no business schema, no queue consumer, no storage/mail
+# adapter. The background-job backend (pg-boss vs. BullMQ) remains
+# undecided — apps/worker's dev command here is the same idle process
+# described in the inventory doc; running it in Compose is not evidence
+# of job processing, and no Redis (or any BullMQ-only dependency) is
+# added.
+#
+# Startup:  docker compose up --build
+# Shutdown: docker compose down            (add -v to also drop the
+#                                            disposable postgres/storage
+#                                            volumes)
+
+networks:
+  relis:
+    name: ${COMPOSE_PROJECT_NAME:-relis}-net
+
+volumes:
+  postgres-data:
+  storage-data:
+
+services:
+  # ---------------------------------------------------------------------
+  # PostgreSQL: one server, two disposable local databases (Control DB +
+  # project-test target). Not published to the host — see
+  # docs/architecture/docker-compose-stack.md for how to reach it when a
+  # documented development endpoint is genuinely needed (docker compose
+  # exec).
+  # ---------------------------------------------------------------------
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-relis}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: ${POSTGRES_DB:-relis_control}
+      PROJECT_TEST_DB_NAME: ${PROJECT_TEST_DB_NAME:-relis_project_example}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [relis]
+
+  # ---------------------------------------------------------------------
+  # One-shot provisioning: runs the EXISTING migration entry point
+  # (packages/database/src/migrate.ts) against each disposable database
+  # target in turn. Both Prisma schemas define zero models today — this
+  # proves the CONTROL_DATABASE_URL / PROJECT_DATABASE_URL contract and
+  # the two distinct database targets wire up correctly; it does not add
+  # any business schema. Reuses docker/worker/Dockerfile's image (see that
+  # file's header comment for why).
+  # ---------------------------------------------------------------------
+  migrate-control:
+    build:
+      context: .
+      dockerfile: docker/worker/Dockerfile
+    command: ["sh", "-c", "pnpm --filter @relis/config build && pnpm --filter @relis/database run migrate control"]
+    environment:
+      NODE_ENV: development
+      CONTROL_DATABASE_URL: postgresql://${POSTGRES_USER:-relis}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-relis_control}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [relis]
+    restart: "no"
+
+  migrate-project:
+    build:
+      context: .
+      dockerfile: docker/worker/Dockerfile
+    command: ["sh", "-c", "pnpm --filter @relis/config build && pnpm --filter @relis/database run migrate project"]
+    environment:
+      NODE_ENV: development
+      PROJECT_DATABASE_URL: postgresql://${POSTGRES_USER:-relis}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${PROJECT_TEST_DB_NAME:-relis_project_example}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [relis]
+    restart: "no"
+
+  # ---------------------------------------------------------------------
+  # apps/api (Hono). Binds API_HOST=0.0.0.0 by default (already
+  # container-to-container compatible — inventory doc §3.1). Its port is
+  # never published to the host: reachable only via nginx's /api/ prefix.
+  # No depends_on a database: apps/api does not connect to one today
+  # (inventory doc §3.1/§7) — not invented here.
+  # ---------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: docker/api/Dockerfile
+    environment:
+      NODE_ENV: development
+      API_PORT: 3001
+      API_HOST: 0.0.0.0
+      # Same-origin via nginx in normal use (see nginx.conf's header
+      # comment); set defensively in case anything calls apps/api
+      # directly during development.
+      API_CORS_ORIGIN: http://localhost:${NGINX_HTTP_PORT:-8080}
+    volumes:
+      - ./apps/api/src:/app/apps/api/src
+      - ./packages/config/src:/app/packages/config/src
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks: [relis]
+
+  # ---------------------------------------------------------------------
+  # apps/web (Next.js dev). NEXT_PUBLIC_API_URL points at nginx's own
+  # published port with an /api prefix — a browser-reachable address, NOT
+  # the internal "api" Compose hostname (see docs/architecture/
+  # docker-compose-stack.md "Internal vs. browser-public addresses").
+  # Never published directly: reachable only through nginx.
+  # ---------------------------------------------------------------------
+  web:
+    build:
+      context: .
+      dockerfile: docker/web/Dockerfile
+    environment:
+      NODE_ENV: development
+      WEB_PORT: 3000
+      NEXT_PUBLIC_API_URL: http://localhost:${NGINX_HTTP_PORT:-8080}/api
+    volumes:
+      - ./apps/web/src:/app/apps/web/src
+      - ./apps/web/public:/app/apps/web/public
+      - ./packages/config/src:/app/packages/config/src
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [relis]
+
+  # ---------------------------------------------------------------------
+  # apps/worker (existing DEV command — tsx watch). start logs and exits;
+  # dev's tsx watch supervisor stays alive after the same log-and-return.
+  # NEITHER mode processes jobs (no queue consumer exists — inventory doc
+  # §3.3/§7). No healthcheck: there is no real readiness signal to check,
+  # and fabricating one (e.g. "process is running") would not be evidence
+  # of job processing — see this task's explicit boundary on that point.
+  # ---------------------------------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: docker/worker/Dockerfile
+    environment:
+      NODE_ENV: development
+    volumes:
+      - ./apps/worker/src:/app/apps/worker/src
+      - ./packages/config/src:/app/packages/config/src
+    networks: [relis]
+
+  # ---------------------------------------------------------------------
+  # Reverse proxy — the ONLY published entry point for web + API. Bound
+  # to loopback. See docker/nginx/nginx.conf for routing.
+  # ---------------------------------------------------------------------
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "127.0.0.1:${NGINX_HTTP_PORT:-8080}:80"
+    depends_on:
+      - web
+      - api
+    healthcheck:
+      # 127.0.0.1, not "localhost": nginx:alpine's musl resolver returns
+      # ::1 before 127.0.0.1 for "localhost" inside this container (real,
+      # reproducible — found via actual verification, not theoretical),
+      # and this nginx.conf's `listen 80;` only binds IPv4, so a
+      # "localhost" request here gets connection-refused even though
+      # nginx is serving correctly. Does not affect host access (Docker
+      # Desktop's own port-forwarding resolves "localhost" to the
+      # published 127.0.0.1 mapping correctly on this host) or any
+      # container-to-container traffic (which always addresses this
+      # service by its Compose name "nginx", never "localhost").
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1/nginx-health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks: [relis]
+
+  # ---------------------------------------------------------------------
+  # Local mail capture. MailHog is prescribed by
+  # context/project-structure.md's docker/mailhog/ entry (not an open
+  # choice — see docs/architecture/local-stack-inventory.md §8). Only its
+  # web UI is published, as a documented development-only endpoint for
+  # inspecting captured mail; SMTP submission (1025) stays internal since
+  # no application mail adapter exists yet to submit through it.
+  # ---------------------------------------------------------------------
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    ports:
+      - "127.0.0.1:${MAILHOG_UI_PORT:-8025}:8025"
+    # No healthcheck: MailHog's official image is commonly built as a
+    # minimal/near-scratch Go binary with no shell or wget bundled, and
+    # that could not be confirmed without a registry pull in this
+    # environment (see docs/architecture/docker-compose-stack.md's "Known
+    # limitations"). Fabricating a healthcheck command that might simply
+    # fail with "not found" — and so be misread as "unhealthy" — would be
+    # worse than having none; readiness is instead polled from the test
+    # client's own side (see stack-smoke.test.ts).
+    networks: [relis]
+
+  # ---------------------------------------------------------------------
+  # Local object storage. SeaweedFS in single-node "weed server" mode
+  # (master + volume + filer + its S3 gateway, all in one process) — an
+  # explicit infrastructure choice approved for this task (not MinIO/
+  # LocalStack/Azurite, and not a production provider decision). The S3
+  # gateway requires the development-only identity in
+  # docker/storage/s3-identities.json (mounted read-only) for every
+  # request — no anonymous access. No application storage adapter exists
+  # yet (inventory doc §6.3); this provisions the service only, per this
+  # task's explicit "service availability is separate from application
+  # integration" boundary.
+  # ---------------------------------------------------------------------
+  storage:
+    image: chrislusf/seaweedfs:3.71
+    command:
+      - server
+      - -dir=/data
+      - -ip=storage
+      - -master.port=9333
+      - -volume.port=8080
+      - -filer.port=8888
+      - -s3
+      - -s3.port=8333
+      - -s3.config=/etc/seaweedfs/s3-identities.json
+    volumes:
+      - storage-data:/data
+      - ./docker/storage/s3-identities.json:/etc/seaweedfs/s3-identities.json:ro
+    ports:
+      - "127.0.0.1:${SEAWEEDFS_S3_PORT:-8333}:8333"
+    healthcheck:
+      # A plain TCP check on 8333 (the S3 gateway port, via BusyBox nc -z
+      # — curl is not present in this image, and BusyBox wget's exit code
+      # cannot distinguish "got a 403" from "connection refused", both
+      # confirmed by direct inspection), not an HTTP check against the
+      # master's /cluster/status on 9333. This matters because this
+      # service's own startup logs show the S3 API only starts LISTENING
+      # on 8333 after its internal filer connection succeeds (there is a
+      # brief window after the master itself is ready where the S3 side
+      # is not yet listening) — checking the master alone let Docker
+      # report "healthy" before a real S3 request could reliably
+      # succeed, reproducibly causing "socket closed" on an authenticated
+      # PUT issued right after. 127.0.0.1, not "localhost": this
+      # Alpine-based image's /etc/hosts maps "localhost" to ::1 only.
+      # Does not affect container-to-container traffic, which always
+      # addresses this service by its Compose name "storage".
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8333"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks: [relis]

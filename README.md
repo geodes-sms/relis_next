@@ -249,9 +249,8 @@ node tooling/scripts/deploy.mjs --skip-worker    # skip running apps/worker's on
 
 `tooling/scripts/deploy.mjs` is a minimal local orchestrator: plain Node
 `child_process` supervision — no Docker, no CI/CD, no new orchestration
-technology. Docker Compose remains the prescribed local/dev/test runtime
-(`context/stack.yml`) but building that stack (`docker/`, `docker-compose*.yml`)
-is a separate, larger, unauthorized-here effort.
+technology. It is independent of, and not superseded by, the Docker
+Compose stack described below — both exist, for different purposes.
 
 Steps, in order, each gated on every earlier one succeeding:
 
@@ -324,4 +323,38 @@ exercised here against isolated fixtures, deliberately-invalid
 configuration, and harmless local test fixtures standing in for services —
 never a real database, a real deployment target, or a real application
 service under supervision.
+
+### Docker Compose (local stack)
+
+```bash
+cp .env.example .env   # once, if not already done
+docker compose up --build
+```
+
+Starts all seven required local-development responsibilities as real
+processes/containers: `web`, `api`, `worker` (dev/watch mode, not a job
+processor), `postgres` (Control DB + a disposable project-test database),
+`nginx` (the only published entry point), `storage` (SeaweedFS's
+S3-compatible endpoint), and `mailhog` (mail capture). Open
+`http://localhost:8080/` for the app; `/api/health` and `/api/ready` are
+reachable through the same proxy. `docker compose down` (add `--volumes`
+to also drop the disposable database/storage volumes) shuts it down.
+
+Full service graph, address types (internal/host-facing/browser-public),
+database-isolation details, and — importantly — this stack's **known
+limitations** (no queue consumer, no storage/mail application adapter)
+are documented in
+[docs/architecture/docker-compose-stack.md](docs/architecture/docker-compose-stack.md).
+Read that before relying on this stack for anything beyond local
+iteration.
+
+`pnpm run test:integration` exercises the stack with real, disposable
+Compose projects (`tests/integration/docker-compose/`); `pnpm run
+test:e2e` additionally verifies the frontend's own browser-issued health
+request through the proxy with a real Chromium instance
+(`tests/e2e/docker-compose/`, via Playwright — requires its browser
+binary installed with `pnpm exec playwright install chromium`, not run
+automatically). Both require Docker; see
+[docs/architecture/docker-compose-stack.md](docs/architecture/docker-compose-stack.md)
+for exactly what each does and does not prove.
 

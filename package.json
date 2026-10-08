@@ -10,13 +10,15 @@
     "typecheck": "pnpm -r typecheck && pnpm run typecheck:tests",
     "typecheck:tests": "pnpm --filter @relis/config build && tsc --noEmit -p tsconfig.tests.json",
     "test": "pnpm -r test && pnpm run test:integration",
-    "test:integration": "vitest run --config vitest.integration.config.ts"
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:e2e": "playwright test"
   },
   "packageManager": "pnpm@11.17.0",
   "engines": {
     "node": ">=22.15"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@relis/config": "workspace:*",
     "@relis/test-utils": "workspace:*",
     "@types/node": "^26.1.1",
