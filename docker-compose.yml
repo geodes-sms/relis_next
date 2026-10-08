@@ -27,16 +27,42 @@
 # added.
 #
 # Startup:  docker compose up --build
-# Shutdown: docker compose down            (add -v to also drop the
-#                                            disposable postgres/storage
-#                                            volumes)
+# Shutdown: docker compose -p relis -f docker-compose.yml down --remove-orphans
+#             -> removes containers/network, KEEPS both named volumes and
+#                all local data; `up -d` afterward recreates with data
+#                intact.
+# Reset:    docker compose -p relis -f docker-compose.yml down --volumes --remove-orphans
+#             -> ALSO deletes this project's postgres-data and
+#                storage-data volumes. Irreversible: both logical
+#                databases and every stored object at once. No backup
+#                exists. Never part of ordinary startup, and never a
+#                broad `docker ... prune` (that reaches other projects).
+# Full lifecycle table, persistence inventory, and clean-recreation
+# steps: docs/architecture/docker-compose-stack.md
+#        ("Persistence, lifecycle, and reset").
 
 networks:
   relis:
     name: ${COMPOSE_PROJECT_NAME:-relis}-net
 
+# Persistent local data — both DISPOSABLE. Compose prefixes each with the
+# project name (`relis_postgres-data` for a default startup from this
+# directory), which is what keeps two Compose projects from ever sharing
+# one. Deliberately neither `external:` nor explicitly `name:`d: an
+# external volume would be a pre-existing resource outside this stack's
+# lifecycle, and a fixed name would make every project collide on the
+# same data. No host path and no production endpoint is involved.
+# See docs/architecture/docker-compose-stack.md "Persistence, lifecycle,
+# and reset" for what each holds and what a reset destroys.
 volumes:
+  # The whole PostgreSQL cluster: BOTH logical databases (the Control DB
+  # and the project-test target) plus server-wide state. One server, one
+  # volume, two databases — a volume per database is deliberately NOT a
+  # requirement here.
   postgres-data:
+  # SeaweedFS's entire single-node state in one directory (master
+  # metadata, object/volume files, filer metadata) — i.e. every
+  # non-production bucket and object.
   storage-data:
 
 services:
@@ -55,6 +81,12 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-relis_control}
       PROJECT_TEST_DB_NAME: ${PROJECT_TEST_DB_NAME:-relis_project_example}
     volumes:
+      # Named volume, never a host bind mount: database data must never
+      # land at a path inside this repository (see the `volumes:` block
+      # above). ./docker/postgres/init is read-only committed SQL, and
+      # the official image runs it ONLY on a genuinely first init (empty
+      # data directory) — so changing POSTGRES_DB/PROJECT_TEST_DB_NAME
+      # against an existing volume does not create the new database.
       - postgres-data:/var/lib/postgresql/data
       - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
@@ -254,6 +286,9 @@ services:
       - -s3.port=8333
       - -s3.config=/etc/seaweedfs/s3-identities.json
     volumes:
+      # Named volume, never a host bind mount — same reason as postgres
+      # above. The identities file is read-only committed development
+      # configuration, not data.
       - storage-data:/data
       - ./docker/storage/s3-identities.json:/etc/seaweedfs/s3-identities.json:ro
     ports:

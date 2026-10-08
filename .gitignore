@@ -147,3 +147,25 @@ test-results/
 playwright-report/
 blob-report/
 playwright/.cache/
+
+# Local disposable stack data (Docker Compose — see
+# docs/architecture/docker-compose-stack.md "Persistence, lifecycle, and
+# reset"). Database and object-storage data live ONLY in Docker named
+# volumes (<project>_postgres-data / <project>_storage-data), never in
+# this working tree, so there is nothing here to ignore for those: no
+# service bind-mounts a writable data directory from the repository.
+#
+# The rules below cover the generated application-artifact directories
+# the required structure reserves at the repository root
+# (context/project-structure.md's storage/ entry: uploads, exports,
+# temp). Those directories do not exist yet and no application adapter
+# writes to them — these rules are deliberately narrow and defensive, so
+# runtime output can never become a tracked artifact if one is added
+# later. Each keeps a committed .gitkeep possible, so the rule can never
+# hide an intentionally-tracked placeholder.
+/storage/uploads/**
+!/storage/uploads/.gitkeep
+/storage/exports/**
+!/storage/exports/.gitkeep
+/storage/temp/**
+!/storage/temp/.gitkeep

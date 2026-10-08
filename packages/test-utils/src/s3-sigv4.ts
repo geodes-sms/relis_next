@@ -8,13 +8,14 @@ import { createHash, createHmac } from "node:crypto";
  * non-chunked PUT and a plain GET, path-style, no query-string signing,
  * no multipart upload.
  *
- * IMPORTANT: built from the documented SigV4 algorithm (canonical request
- * -> string to sign -> derived signing key) using only Node's built-in
- * `crypto` — it has NOT been executed against a real S3-compatible
- * server in this environment (no Docker was available when this was
- * written; see the final report for this sub-issue). Verify it end to
- * end the first time Docker is available here, and adjust the header
- * set/canonicalization below if the signature is rejected.
+ * Built from the documented SigV4 algorithm (canonical request -> string
+ * to sign -> derived signing key) using only Node's built-in `crypto`.
+ * Originally written with no Docker available, and since **verified by
+ * real execution** against the live `storage` container: a signed
+ * createBucket + PUT + GET round-trip succeeds byte-for-byte (sub-issue
+ * #47), and sub-issue #48's persistence check reuses the same signed
+ * operations across container stop/start, recreation, and reset. The
+ * header set and canonicalization below needed no adjustment.
  */
 
 export interface S3Credentials {
@@ -127,4 +128,60 @@ export async function putS3Object(target: S3ObjectTarget, credentials: S3Credent
 export async function getS3Object(target: S3ObjectTarget, credentials: S3Credentials): Promise<Response> {
   const { url, headers } = signS3Request("GET", target, credentials);
   return fetch(url, { method: "GET", headers });
+}
+
+export interface S3ErrorResponse {
+  status: number;
+  /** The parsed `<Code>` of an S3-compatible XML error body (e.g. "NoSuchKey"), or `undefined` when the body isn't one. */
+  code: string | undefined;
+  message: string | undefined;
+}
+
+/**
+ * Parses an S3-compatible XML error body's `<Code>` and `<Message>`.
+ * Pure string parsing — no network, no Response object — so it can be
+ * unit-tested directly with synthetic bodies (a real NoSuchKey/
+ * NoSuchBucket body, an AccessDenied body, an empty body, HTML from an
+ * unrelated proxy error, etc.), without any real S3-compatible server.
+ * Returns `{ code: undefined, message: undefined }` for a body that
+ * isn't a recognizable S3 XML error, rather than throwing — a caller
+ * must decide what an unparseable body means for its own claim (see
+ * `isS3ObjectAbsent`, which treats "no recognizable Code" as NOT proof
+ * of absence).
+ */
+export function parseS3ErrorBody(xml: string): { code: string | undefined; message: string | undefined } {
+  const codeMatch = /<Code>([^<]*)<\/Code>/.exec(xml);
+  const messageMatch = /<Message>([^<]*)<\/Message>/.exec(xml);
+  return { code: codeMatch?.[1], message: messageMatch?.[1] };
+}
+
+/**
+ * Reads `response`'s status and (if present) its parsed S3 XML error
+ * body into one plain, inspectable value — the shape a test asserts on
+ * directly, rather than re-deriving status/code checks inline at each
+ * call site.
+ */
+export async function readS3ErrorResponse(response: Response): Promise<S3ErrorResponse> {
+  const body = await response.text().catch(() => "");
+  const { code, message } = parseS3ErrorBody(body);
+  return { status: response.status, code, message };
+}
+
+/**
+ * True exactly when `info` is the SPECIFIC "this object/bucket is
+ * genuinely absent" S3 response: HTTP 404 together with an S3 error
+ * `Code` of `NoSuchKey` or `NoSuchBucket`. Pure — operates on the
+ * already-parsed `S3ErrorResponse`, so it is independently
+ * unit-testable with constructed fakes.
+ *
+ * Deliberately narrower than "status >= 400": an authentication failure
+ * (401/403, e.g. AccessDenied or SignatureDoesNotMatch), a server error
+ * (5xx), or a response with no parseable `Code` at all must NEVER read
+ * as "the object was deleted" — each of those means something else
+ * entirely (a bad credential, a server fault, a malformed request), and
+ * accepting any of them as deletion evidence would let a broken check
+ * or a broken server masquerade as a successful reset.
+ */
+export function isS3ObjectAbsent(info: S3ErrorResponse): boolean {
+  return info.status === 404 && (info.code === "NoSuchKey" || info.code === "NoSuchBucket");
 }
