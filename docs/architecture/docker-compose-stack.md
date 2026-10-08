@@ -1,13 +1,17 @@
 # Local Docker Compose stack
 
-Implements local sub-issue [02.02 — Define services and shared
+Implements local sub-issues [02.02 — Define services and shared
 configuration, including the Control DB and per-project test
-databases](../../../context/notion-tasks/sub-issues/02-02.md) (parent: [02
+databases](../../../context/notion-tasks/sub-issues/02-02.md) and
+[02.03 — Configure local persistent volumes and exclude them from version
+control](../../../context/notion-tasks/sub-issues/02-03.md) (parent: [02
 — Add Docker Compose local stack](../../../context/notion-tasks/02-docker-compose.md)).
 Builds directly on [the local-stack inventory](local-stack-inventory.md)
 from the preceding sub-issue — read that document first for the
 application startup contracts this stack reuses unchanged (it does not
-re-derive them here).
+re-derive them here). Data persistence, the stop/start/recreate/reset
+lifecycle, and what a reset destroys are in
+["Persistence, lifecycle, and reset"](#persistence-lifecycle-and-reset).
 
 ## Scope
 
@@ -78,12 +82,18 @@ databases via the `migrate-control` / `migrate-project` one-shot services.
 Subsequent runs can drop `--build` unless `package.json`/`pnpm-lock.yaml`
 changed.
 
-## Shutdown
+## Shutdown and reset
 
 ```bash
-docker compose down            # stop and remove containers/network
-docker compose down --volumes  # also drop the disposable postgres/storage volumes
+docker compose -p relis -f docker-compose.yml stop                              # stop, keep containers and data
+docker compose -p relis -f docker-compose.yml down --remove-orphans             # remove containers/network, KEEP data
+docker compose -p relis -f docker-compose.yml down --volumes --remove-orphans   # reset: DELETE this project's data
 ```
+
+The last command destroys both local databases and every stored
+object. Read ["Persistence, lifecycle, and reset"](#persistence-lifecycle-and-reset)
+below for the full lifecycle table, exactly what a reset deletes, and
+how to recreate the stack afterward.
 
 ## Service graph and addresses
 
@@ -171,6 +181,220 @@ official postgres image's own creation of `POSTGRES_DB`
 (`relis_control`). Neither Prisma schema defines a model, so this proves
 the two-target connection contract, not a business schema — consistent
 with this task's "without adding business models" boundary.
+
+## Persistence, lifecycle, and reset
+
+Implements local sub-issue [02.03 — Configure local persistent volumes
+and exclude them from version
+control](../../../context/notion-tasks/sub-issues/02-03.md). Everything
+below describes **local, disposable development data only** — there is no
+production target, no external volume, and no backup or restore
+mechanism anywhere in this stack.
+
+### What persists, and where
+
+Two Docker **named volumes** hold every byte of persistent state. One
+PostgreSQL server with one physical volume holds *both* logical
+databases — deliberately: a container or volume per database is not a
+requirement of this stack and is not implemented.
+
+| Owning service | Container path | Backed by | Holds | Disposable? |
+| --- | --- | --- | --- | --- |
+| `postgres` | `/var/lib/postgresql/data` | named volume `<project>_postgres-data` | The whole PostgreSQL cluster: **both** logical databases (the Control DB `relis_control` *and* the project-test database `relis_project_example`), plus server-wide state (roles, WAL, the `postgres`/`template*` databases). | Yes |
+| `storage` | `/data` | named volume `<project>_storage-data` | SeaweedFS's entire single-node state in one directory: master metadata, volume (object) files, and filer metadata — i.e. every bucket and non-production object. | Yes |
+
+`<project>` is the Compose project name (see "Project scoping" below).
+With the default startup from this directory that is `relis`, so the two
+real volume names are `relis_postgres-data` and `relis_storage-data`.
+
+Everything else mounted into a container is **configuration or source,
+never generated data**:
+
+| Owning service | Container path | Backed by | Kind |
+| --- | --- | --- | --- |
+| `postgres` | `/docker-entrypoint-initdb.d` | `./docker/postgres/init` (read-only) | Committed first-init SQL. |
+| `storage` | `/etc/seaweedfs/s3-identities.json` | `./docker/storage/s3-identities.json` (read-only) | Committed development-only S3 identity. |
+| `nginx` | `/etc/nginx/nginx.conf` | `./docker/nginx/nginx.conf` (read-only) | Committed proxy routing. |
+| `api` | `/app/apps/api/src` | `./apps/api/src` | Committed source, mounted for live reload. |
+| `web` | `/app/apps/web/src`, `/app/apps/web/public` | `./apps/web/src`, `./apps/web/public` | Committed source/assets, mounted for live reload. |
+| `worker` | `/app/apps/worker/src` | `./apps/worker/src` | Committed source, mounted for live reload. |
+| `api`, `web`, `worker` | `/app/packages/config/src` | `./packages/config/src` | Committed shared-config source (see "Development mounts"). |
+
+Generated **application** artifacts — `node_modules`, `dist`, `.next` —
+are never mounted at all: each lives only inside its image/container
+layer (see "Development mounts" above) and is rebuilt from the committed
+lockfile and source. They are therefore not persistent across container
+recreation either, and recreating a container re-derives them.
+
+The consequence worth stating explicitly: **no service bind-mounts a
+writable data directory out of this repository.** Database and object
+data cannot become a tracked repository artifact, because no path in the
+working tree ever holds any. `tests/integration/docker-compose/persistence.test.ts`
+asserts this directly against the resolved Compose configuration, which
+is a stronger guarantee than an ignore rule.
+
+`.gitignore` covers the remaining cases: real environment files
+(`.env`, `.env.*`, with `.env.example` the committed exception),
+generated build output (`dist`, `.next`, `node_modules`), coverage, test
+run output (`test-results/`, `playwright-report/`, `blob-report/`), and —
+defensively — the generated-artifact directories the required structure
+reserves at `storage/uploads/`, `storage/exports/`, and `storage/temp/`
+(those do not exist yet and no application adapter writes to them).
+`tests/integration/docker-compose/persistence-ignore-rules.test.ts`
+verifies all of it with read-only Git commands, and additionally asserts
+that no ignore pattern is broad enough to shadow a tracked source file.
+
+### Project scoping
+
+Compose prefixes each declared volume with the project name, so the
+project name alone decides which data a startup reuses:
+
+| Startup | Project name | Volumes used |
+| --- | --- | --- |
+| `docker compose up` from this directory | `relis` (the directory name) | `relis_postgres-data`, `relis_storage-data` |
+| `docker compose -p other up` | `other` | `other_postgres-data`, `other_storage-data` |
+| An integration test's disposable project | `relis-persist-<random>` etc. | `relis-persist-<random>_postgres-data`, … |
+
+Consequences, all verified rather than assumed:
+
+- **A normal startup reuses the intended development volumes.** Running
+  `docker compose up` again — with or without `--build`, and after any
+  number of `docker compose down` cycles — reattaches `relis_*` and
+  finds the previous data.
+- **Separate Compose projects cannot share a data volume.** Neither
+  volume is `external: true`, neither declares an explicit `name:`, and
+  nothing points at a path outside the repository or at a
+  machine-specific location, so two projects can only ever resolve to
+  different volume names. `persistence.test.ts` proves this with a
+  second, independently-named Compose project whose own fixture row is
+  invisible from the first and survives the first's reset.
+- The Compose **network** is likewise per-project: it is declared as
+  `${COMPOSE_PROJECT_NAME:-relis}-net`, and Compose V2 feeds `-p` into
+  that interpolation (confirmed: `docker compose -p X config` resolves
+  the network name to `X-net`), so a `-p`-scoped run does not reuse the
+  default stack's network either.
+- No production endpoint, external volume, or absolute host path appears
+  anywhere in `docker-compose.yml`; every bind source is a
+  repository-relative path.
+
+### Lifecycle operations
+
+Always pass the project and file explicitly — `-p <project> -f
+docker-compose.yml` — so a command can never act on a different project
+than intended. (`docker compose` infers the project from the current
+directory's name when `-p` is omitted; being explicit costs nothing and
+removes the ambiguity entirely, which matters most for the last row.)
+
+| Goal | Command | Containers | Named volumes | Data |
+| --- | --- | --- | --- | --- |
+| **Stop**, keeping containers and data | `docker compose -p relis -f docker-compose.yml stop` | Stopped, **kept** | Kept | **Kept** |
+| **Start** again (same containers) | `docker compose -p relis -f docker-compose.yml start` | Restarted in place | Kept | **Kept** |
+| **Restart** in one step | `docker compose -p relis -f docker-compose.yml restart` | Restarted in place | Kept | **Kept** |
+| **Remove containers and the network**, keeping data | `docker compose -p relis -f docker-compose.yml down --remove-orphans` | **Removed** | **Kept** | **Kept** |
+| Recreate after that removal | `docker compose -p relis -f docker-compose.yml up -d` | Newly created | Reattached | **Kept** |
+| **Reset** — delete this project's disposable data | `docker compose -p relis -f docker-compose.yml down --volumes --remove-orphans` | **Removed** | **DELETED** | **DESTROYED** |
+
+The only difference between the fourth row and the last is the
+`--volumes` flag. That flag is the entire reset.
+
+### ⚠️ Reset destroys data — read before running it
+
+`docker compose -p relis -f docker-compose.yml down --volumes --remove-orphans`
+**permanently and irreversibly deletes**:
+
+- `relis_postgres-data` — and with it **both** logical databases at
+  once: the Control DB (`relis_control`) *and* the project-test database
+  (`relis_project_example`), plus every table, row, and role on that
+  server. They share one volume; there is no way to reset one and keep
+  the other.
+- `relis_storage-data` — and with it **every bucket and object** in the
+  local SeaweedFS instance.
+
+It does **not** touch: your source code, `.env`, any other Compose
+project's containers or volumes, or the built images (those are a build
+cache, removed separately and deliberately if ever wanted). There is no
+backup, no snapshot, and no undo — this stack intentionally implements
+none, because its data is local and disposable by design.
+
+Substitute the real project name for `relis` if you started the stack
+with a different `-p`. If you are unsure what a reset would delete, list
+it first — a read-only check:
+
+```bash
+docker volume ls --filter label=com.docker.compose.project=relis
+```
+
+Never reset as part of ordinary startup: `up`, `up --build`, `stop`,
+`start`, `restart`, and `down` (without `--volumes`) all keep data, and
+that is the normal path.
+
+**Do not** use broad commands to clean up instead. `docker system prune`,
+`docker volume prune`, `docker builder prune --all`, a bare
+`docker volume rm` against a guessed name, or deleting a directory with
+`rm -rf` all reach beyond this project and can destroy unrelated
+containers, volumes, and other developers' or other projects' data. The
+scoped `down --volumes` above is the only reset this stack needs, which
+is why **no reset script is provided**: the existing Compose commands and
+this table are sufficient, and a script would add a second, more
+dangerous way to do the same thing.
+
+### Clean recreation after a reset
+
+Everything needed to come back is committed; no manual data restoration
+step exists or is required.
+
+```bash
+docker compose -p relis -f docker-compose.yml up -d --build
+```
+
+That alone recreates, from committed configuration plus the documented
+local setup (`cp .env.example .env`, see "Prerequisites"):
+
+1. Both named volumes, empty, under the same names.
+2. An initialised PostgreSQL cluster. Because the data directory is empty
+   again, the official image runs its own first-init sequence: it creates
+   `POSTGRES_DB` (the Control DB) and then runs everything in
+   `/docker-entrypoint-initdb.d`, so
+   `docker/postgres/init/01-create-project-test-database.sh` recreates
+   the project-test database too.
+3. A fresh single-node SeaweedFS instance with no buckets and no objects.
+4. `migrate-control` and `migrate-project`, each running the existing
+   migration entry point against its own target (see "Database
+   isolation").
+
+Verify with the same read-only commands used to inspect any startup —
+`docker compose -p relis -f docker-compose.yml ps` and the `/api/health`
+endpoint through nginx.
+
+**Honest limitations of "recreated":**
+
+- **The databases come back empty, and that is all they can be.** Both
+  `packages/database/prisma/control/schema.prisma` and
+  `.../project/schema.prisma` define **zero models** and have **no
+  `migrations/` directory**, so `migrate-control`/`migrate-project` have
+  nothing to apply: they validate the connection contract and exit 0.
+  Recreation restores *databases*, not a schema — there is no business
+  schema to restore, and none is added here.
+- **No seed data of any kind.** Nothing repopulates application content
+  after a reset; any fixture you had is gone for good. Test fixtures are
+  created by the tests that need them.
+- **No backup or restore.** Not implemented, not planned in this slice.
+  If local data matters to you, do not reset.
+- **`docker/postgres/init/` only runs on a genuinely first init** — i.e.
+  against an empty data directory. Changing `POSTGRES_DB` or
+  `PROJECT_TEST_DB_NAME` while `relis_postgres-data` still exists does
+  **not** create the newly-named database; the init scripts are simply
+  not re-run. Either create it manually or reset the volume (destroying
+  the existing data) for the new name to take effect.
+- **No per-project provisioning.** `relis_project_example` is a single
+  disposable project-test target, not a per-project database factory.
+  Creating a database per real review project is a separate, unimplemented
+  feature.
+- **A volume's on-disk format belongs to the image that wrote it.** Data
+  written by `postgres:17-alpine` or `chrislusf/seaweedfs:3.71` is not
+  guaranteed readable after a major version change of either image; a
+  reset is the expected remedy in that case, since this data is
+  disposable.
 
 ## Known limitations (read before relying on this stack)
 
@@ -325,19 +549,87 @@ with this task's "without adding business models" boundary.
   merely asserting — that its static readiness check does not detect the
   outage.
 
-Every file gates on a **synchronous** Docker-availability check
-(`isDockerAvailableSync`, in `packages/test-utils`) evaluated at module
-load so `describe.runIf`/`skipIf` see the real value during Vitest's
-collection pass (an `async` check inside a `beforeAll` is still `false` at
-that point, since hooks run after collection — see that function's own
-comment). This stack was first authored in an environment with no Docker
-at all, where every one of these suites was skipped by necessity. It was
-**later verified by real execution** once Docker Desktop (with a
-Linux-container engine) became available: all four files now pass for
-real — see the final report for sub-issue #47 for exact commands, exit
-codes, and the two real defects that verification found and fixed
-(both now described in "Known limitations" above, not as open
-questions).
+- `persistence.test.ts` — the real disposable-persistence, scoped-reset,
+  and clean-recreation check for both named volumes (see
+  ["Persistence, lifecycle, and reset"](#persistence-lifecycle-and-reset)).
+  Starts only the two services that own data (`postgres`, `storage`), so
+  it builds no application image. In order, against the real daemon:
+  - The actual volumes Compose created, confirmed by `docker volume
+    inspect`'s own `com.docker.compose.project` / `.volume` labels — an
+    ownership record, not a name-prefix guess — and asserted not to be
+    `external` and not to have existed beforehand.
+  - Every bind mount in the **resolved** configuration is read-only
+    configuration or an application source directory; nothing writable
+    points at a data directory in the working tree, and neither
+    `/var/lib/postgresql/data` nor `/data` is bind-mounted. This is the
+    structural reason database/object data cannot become a tracked
+    repository artifact.
+  - The Control DB and project-test database are distinct at the
+    connection targets `migrate-control`/`migrate-project` are actually
+    configured with (read from the resolved configuration, with
+    credentials discarded — see `resolveComposePersistence`), both exist
+    on the one server, and a fixture row planted in each is invisible
+    from the other **in both directions**.
+  - A fixture row and a real signed-S3-uploaded object survive a
+    `stop`/`start`, asserted together with the container ids being
+    **unchanged** (so this is genuinely a restart).
+  - Both survive `down --remove-orphans` (no `--volumes`) followed by
+    `up`, asserted together with the container ids having **changed**
+    (genuinely recreated) and both volumes still existing in between.
+  - `down --volumes` deletes exactly the recorded volumes; a **second,
+    independently-named Compose project** running its own `postgres`
+    with its own fixture row is then shown to still have its volume and
+    its row. Without that second project, "the reset removed only its
+    own volumes" would be vacuous on a daemon with nothing else on it.
+  - Recreating afterward works from committed configuration alone, both
+    databases are provisioned again by the init path, and the prior
+    fixture table and object are **gone**.
+
+  Destructive steps are gated: both project names carry a random suffix,
+  volume ownership is confirmed by label immediately before the reset
+  (`confirmDisposableOwnershipOrStop` throws rather than deleting on an
+  assumption), every volume present before the run is asserted to still
+  exist after it, all published ports are ephemeral, and deletion is
+  only ever a `-p`-scoped `docker compose down --volumes` — never
+  `docker volume rm`, never a prune, never a filesystem deletion. The
+  `afterAll` hook tears down **both** projects, reports a failure for
+  either without discarding the other, and verifies the result
+  (this project's volumes gone, every pre-existing volume still there)
+  instead of trusting the exit code.
+- `persistence-ignore-rules.test.ts` — the repository-hygiene half, and
+  the only file here that needs **no Docker daemon** (just `git` and this
+  checkout). Read-only Git throughout — `git ls-files`, `git check-ignore
+  --no-index`, `git status --porcelain` (helpers in
+  `packages/test-utils/src/git.ts`): nothing is ever staged or created to
+  probe a rule, and no real secret is written, since `check-ignore
+  --no-index` evaluates a path whether or not it exists. Asserts that
+  real environment files (root and per-package), generated build output,
+  test run output, and the structure-reserved `storage/{uploads,exports,temp}/`
+  directories are all ignored; that `.env.example`, the committed
+  development configuration (`docker/postgres/init/`,
+  `docker/storage/s3-identities.json`, `docker/nginx/nginx.conf`), the
+  fixtures, and a `.gitkeep` inside each ignored `storage/` directory all
+  stay trackable; that `.env.example` is the only tracked environment
+  file and no generated artifact is tracked; that nothing risky is
+  sitting untracked in the working tree; and — via `git ls-files -i -c`
+  — that **no ignore pattern is broad enough to shadow a tracked source
+  file**.
+
+Every file that needs a container runtime gates on a **synchronous**
+Docker-availability check (`isDockerAvailableSync`, in
+`packages/test-utils`) evaluated at module load so
+`describe.runIf`/`skipIf` see the real value during Vitest's collection
+pass (an `async` check inside a `beforeAll` is still `false` at that
+point, since hooks run after collection — see that function's own
+comment). `persistence-ignore-rules.test.ts` is the exception by design:
+it needs only `git`, and gates on `isGitRepository` instead. This stack
+was first authored in an environment with no Docker at all, where every
+one of those suites was skipped by necessity. It was **later verified by
+real execution** once Docker Desktop (with a Linux-container engine)
+became available: all six files now pass for real — see the final
+reports for sub-issues #47 and #48 for exact commands, exit codes, and
+the two real defects #47's verification found and fixed (both now
+described in "Known limitations" above, not as open questions).
 
 ### Cleanup robustness
 
@@ -357,12 +649,23 @@ creates — the project's implicitly-created network (Compose creates this
 for any command in a project, `run` included) was being left behind. It
 now cleans up too.
 
+`persistence.test.ts` extends the same contract to two projects at once
+(its own and its bystander) and additionally verifies the cleanup's
+RESULT rather than its exit code: afterward, no volume may still carry
+either project's label, and every volume that existed before the run
+must still exist. It is also the one file that calls a deliberately
+NON-destructive `down` mid-test (`composeDownKeepVolumes` —
+`--remove-orphans` without `--volumes`), which is the lifecycle step
+whose whole point is that data survives it; its `afterAll` cleanup is
+still the `--volumes` form.
+
 **Verified by real execution:** across every real test run during
-sub-issue #47's verification (stack-smoke, config-validation,
-dependency-unavailable, the e2e spec, plus several manual debug
-sessions), `docker ps -a`, `docker network ls`, and `docker volume ls`
-showed zero leftover containers, networks, or volumes afterward — in
-both the normal-completion and the deliberately-failing scenarios. Built
+sub-issue #47's and #48's verification (stack-smoke, config-validation,
+dependency-unavailable, persistence, the e2e spec, plus several manual
+debug sessions), `docker ps -a`, `docker network ls`, and `docker volume
+ls` showed zero leftover containers, networks, or volumes afterward — in
+both the normal-completion and the deliberately-failing scenarios, and
+after the deliberate reset in `persistence.test.ts`. Built
 images are NOT removed by `docker compose down` (expected, standard
 behavior — they are a build cache, not disposed with the project);
 cleaning those up, when desired, is a separate, manual step outside this

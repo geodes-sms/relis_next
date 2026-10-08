@@ -337,24 +337,51 @@ processor), `postgres` (Control DB + a disposable project-test database),
 `nginx` (the only published entry point), `storage` (SeaweedFS's
 S3-compatible endpoint), and `mailhog` (mail capture). Open
 `http://localhost:8080/` for the app; `/api/health` and `/api/ready` are
-reachable through the same proxy. `docker compose down` (add `--volumes`
-to also drop the disposable database/storage volumes) shuts it down.
+reachable through the same proxy.
+
+#### Lifecycle and reset
+
+Local data lives in two Docker named volumes, `relis_postgres-data` (the
+PostgreSQL server holding **both** the Control DB and the project-test
+database) and `relis_storage-data` (every SeaweedFS bucket and object).
+Data survives everything except an explicit reset:
+
+```bash
+docker compose -p relis -f docker-compose.yml stop                              # stop, keep containers and data
+docker compose -p relis -f docker-compose.yml start                             # start again, same containers
+docker compose -p relis -f docker-compose.yml down --remove-orphans             # remove containers/network, KEEP data
+docker compose -p relis -f docker-compose.yml up -d                             # recreate containers, data intact
+docker compose -p relis -f docker-compose.yml down --volumes --remove-orphans   # RESET: permanently delete this project's data
+```
+
+⚠️ The last command is **irreversible** and destroys both local
+databases and every stored object at once (they share one volume each).
+There is no backup or restore. It never runs as part of ordinary
+startup, and no broad `docker ... prune` is ever needed or
+recommended — those reach beyond this project. Recreating afterward is
+just `up -d --build`, which reprovisions both (empty) databases from
+committed configuration.
 
 Full service graph, address types (internal/host-facing/browser-public),
-database-isolation details, and — importantly — this stack's **known
-limitations** (no queue consumer, no storage/mail application adapter)
-are documented in
+database isolation, the complete persistence inventory and lifecycle
+table, exactly what a reset deletes, how to recreate the stack
+afterward, and — importantly — this stack's **known limitations** (no
+queue consumer, no storage/mail application adapter, empty schemas, no
+seeds or backups) are documented in
 [docs/architecture/docker-compose-stack.md](docs/architecture/docker-compose-stack.md).
 Read that before relying on this stack for anything beyond local
 iteration.
 
 `pnpm run test:integration` exercises the stack with real, disposable
-Compose projects (`tests/integration/docker-compose/`); `pnpm run
+Compose projects (`tests/integration/docker-compose/`) — including the
+persistence/reset/recreation lifecycle above and read-only Git checks
+that stack data and environment files stay untracked; `pnpm run
 test:e2e` additionally verifies the frontend's own browser-issued health
 request through the proxy with a real Chromium instance
 (`tests/e2e/docker-compose/`, via Playwright — requires its browser
 binary installed with `pnpm exec playwright install chromium`, not run
-automatically). Both require Docker; see
+automatically). Both need a reachable Docker daemon for their
+container checks (the ignore-rule checks need only `git`); see
 [docs/architecture/docker-compose-stack.md](docs/architecture/docker-compose-stack.md)
 for exactly what each does and does not prove.
 
