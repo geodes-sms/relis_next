@@ -370,7 +370,31 @@ queue consumer, no storage/mail application adapter, empty schemas, no
 seeds or backups) are documented in
 [docs/architecture/docker-compose-stack.md](docs/architecture/docker-compose-stack.md).
 Read that before relying on this stack for anything beyond local
-iteration.
+iteration. In particular, that document also covers (sub-issue 02.05):
+
+- **["Local access quick reference"](docs/architecture/docker-compose-stack.md#local-access-quick-reference)**
+  — every host-facing URL and internal-only address in one table, with
+  its purpose and limitation.
+- **["Compose interpolation vs. application environment
+  loading"](docs/architecture/docker-compose-stack.md#compose-interpolation-vs-application-environment-loading--two-separate-mechanisms)**
+  — why editing the root `.env` does **not** reach `apps/api`/`apps/web`/
+  `apps/worker`'s own `loadEnvFiles` inside a container (it only feeds
+  Compose's own `${VAR}` interpolation in `docker-compose.yml`).
+- **["Diagnostics"](docs/architecture/docker-compose-stack.md#diagnostics)**
+  — actionable steps (with real captured error text) for Docker being
+  unavailable, an occupied host port, a failed image build, rejected
+  Compose configuration, a failed migration, and an unavailable API
+  upstream. None of it recommends restarting Docker Desktop or a broad
+  prune as a routine step.
+- **["Mail capture"](docs/architecture/docker-compose-stack.md#mail-capture)**
+  — MailHog's UI/API, verified to genuinely be MailHog's own interface
+  (not an arbitrary `200`), and why no application mail adapter exists to
+  send anything through it yet.
+- **["Job observability"](docs/architecture/docker-compose-stack.md#job-observability)**
+  — stated plainly: **no job-observability endpoint exists** in this
+  stack. Only `apps/worker`'s container status/logs are available, and
+  that liveness is explicitly **not** evidence any job was consumed or
+  completed — there is no queue consumer to observe.
 
 `pnpm run test:integration` exercises the stack with real, disposable
 Compose projects (`tests/integration/docker-compose/`) — including the

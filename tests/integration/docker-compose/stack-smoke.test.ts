@@ -49,6 +49,13 @@ import {
 //     running (watcher liveness) and completed its own startup/config
 //     path (its log line) — explicitly NOT claimed as job processing;
 //     no queue consumer exists or is added here.
+//   - MailHog's root page and message-listing API ARE MailHog's own
+//     mail-capture interface (local sub-issue 02.05) — checked via its
+//     distinctive `<title>MailHog</title>`/`ng-app="mailhogApp"` markup
+//     and its exact `{total,count,start,items}` API shape, not merely a
+//     generic HTTP 200 (which any server would satisfy). Not exercised
+//     through the application: no mail adapter exists in apps/api or
+//     apps/worker today, so `items` is correctly empty.
 //   - A real SeaweedFS S3-gateway upload/download round-trip, signed
 //     with the development-only credentials in
 //     docker/storage/s3-identities.json — NOT merely "the container
@@ -275,10 +282,36 @@ describe.runIf(dockerAvailable)("disposable stack smoke check", () => {
     expect(logs.stdout).toContain("ReLiS worker started");
   });
 
-  it("captures mail-capture's web UI as a reachable development-only endpoint", async () => {
+  it("serves MailHog's OWN mail-capture interface — not merely an arbitrary HTTP 200", async () => {
+    // Local sub-issue 02.05: a bare `200` from this port is not evidence
+    // it is actually MailHog — any web server would satisfy that. Two
+    // independent, MailHog-SPECIFIC signals are checked instead, each
+    // confirmed by direct inspection of a real `mailhog/mailhog:v1.0.1`
+    // container during this task:
     const mailhogPort = await composePort(project, "mailhog", 8025);
+
+    // 1. The root page is MailHog's own Angular UI shell — its <title>
+    // and navbar brand both read "MailHog" (apps/web's homepage, the only
+    // other UI this stack serves, has neither).
     const ui = await fetch(`http://127.0.0.1:${mailhogPort}/`);
     expect(ui.status).toBe(200);
+    const uiBody = await ui.text();
+    expect(uiBody).toContain("<title>MailHog</title>");
+    expect(uiBody).toContain('ng-app="mailhogApp"');
+
+    // 2. MailHog's own message-listing API returns its distinctive JSON
+    // shape ({total, count, start, items}) — a contract specific to
+    // MailHog's real API, not a generic page. Also proves it is
+    // functioning as a mail CAPTURE interface (a queryable inbox), not
+    // just a static page that happens to look like one. An empty `items`
+    // array here is expected and correct: nothing has been sent to it in
+    // this test (apps/api/apps/worker have no mail adapter — see "Known
+    // limitations" — so this is deliberately NOT exercised through the
+    // application), not a sign of malfunction.
+    const api = await fetch(`http://127.0.0.1:${mailhogPort}/api/v2/messages`);
+    expect(api.status).toBe(200);
+    const inbox = (await api.json()) as { total: number; count: number; start: number; items: unknown[] };
+    expect(inbox).toEqual({ total: 0, count: 0, start: 0, items: [] });
   });
 
   it("performs a real, credentialed object-storage upload and download round-trip", async () => {
