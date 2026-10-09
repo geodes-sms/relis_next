@@ -251,7 +251,7 @@ export async function composeLogs(project: ComposeProject, service: string, opti
 }
 
 /** The container id for `service` (its most recent one, including already-exited containers via `-a`), or `undefined` if none exists yet. */
-async function getContainerId(project: ComposeProject, service: string): Promise<string | undefined> {
+export async function getContainerId(project: ComposeProject, service: string): Promise<string | undefined> {
   const result = await runToCompletion("docker", composeArgs(project, ["ps", "-a", "-q", service]), {
     cwd: project.cwd,
     timeoutMs: 15000,
@@ -325,6 +325,77 @@ export async function waitForHttpOk(url: string, timeoutMs = 60000): Promise<voi
     }
   }
   throw new Error(`Timed out after ${timeoutMs}ms waiting for ${url} to accept connections. Last error: ${String(lastError)}`);
+}
+
+/**
+ * Polls `url` with plain HTTP GET requests until a response's status code
+ * satisfies `isAcceptable`, or `timeoutMs` elapses — unlike `waitForHttpOk`
+ * (which accepts ANY status, including a failure one, as "the server is
+ * accepting connections"), this is for a BOUNDED wait on a specific
+ * outcome, e.g. "the proxy reports success again after its upstream was
+ * restored." Returns the accepted `Response` so the caller can inspect its
+ * body without a second request.
+ *
+ * Genuinely bounded by `timeoutMs` overall, not merely "checked between
+ * requests": each individual `fetch` is given an `AbortController` tied to
+ * the REMAINING time left in the overall deadline (`deadline - Date.now()`
+ * at the moment that request starts), not a fresh `timeoutMs` of its own —
+ * a single pending request (e.g. a proxy that has silently dropped
+ * packets toward a dead upstream, with no reply at all) can therefore
+ * never push the total wait past `timeoutMs`. The retry delay between
+ * attempts is likewise clamped to whatever remains of the deadline, never
+ * a fixed delay that could itself overshoot it.
+ *
+ * Every REJECTED response's body is explicitly released
+ * (`response.body?.cancel()`) before the next attempt — this is not a
+ * cosmetic cleanup: an un-drained response body can otherwise stall a
+ * kept-alive connection's reuse by the HTTP client on the very next
+ * request. The ACCEPTED response is returned untouched — its body is
+ * never read or cancelled here — so the caller can still consume it
+ * exactly once.
+ */
+export async function waitForHttpStatus(
+  url: string,
+  isAcceptable: (status: number) => boolean,
+  timeoutMs = 60000,
+): Promise<Response> {
+  const deadline = Date.now() + timeoutMs;
+  let lastStatus: number | undefined;
+  let lastError: unknown;
+
+  for (;;) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+
+    const controller = new AbortController();
+    const abortTimer = setTimeout(() => controller.abort(), remaining);
+    try {
+      const response = await fetch(url, { signal: controller.signal });
+      if (isAcceptable(response.status)) {
+        return response;
+      }
+      lastStatus = response.status;
+      // Not the response we're waiting for — release it (see doc comment
+      // above) rather than leaving its body unconsumed.
+      try {
+        await response.body?.cancel();
+      } catch {
+        // Already closed/errored; nothing left to release.
+      }
+    } catch (error) {
+      lastError = error;
+    } finally {
+      clearTimeout(abortTimer);
+    }
+
+    const retryDelay = Math.min(1000, deadline - Date.now());
+    if (retryDelay <= 0) break;
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, retryDelay));
+  }
+  throw new Error(
+    `Timed out after ${timeoutMs}ms waiting for ${url} to reach an acceptable status. ` +
+      `Last observed status: ${lastStatus ?? "(none — request never completed)"}. Last error: ${String(lastError)}`,
+  );
 }
 
 /**
@@ -989,4 +1060,139 @@ export async function resolveComposePersistence(project: ComposeProject, env: Co
   }
 
   return { projectName: parsed.name ?? project.projectName, volumeNames, externalVolumes, bindMounts, databaseTargets };
+}
+
+/** One `ports:` entry as `docker compose config --format json` resolves it for a service. */
+export interface ResolvedComposePort {
+  /** The container-side port being published. */
+  target: number;
+  /** Host-side port, when published (may be unset for an ephemeral/unspecified mapping). */
+  published?: string;
+  /** Host IP the port is bound to, exactly as resolved — e.g. `"127.0.0.1"`, `"0.0.0.0"`, or unset (meaning every interface). Never assume loopack when this is absent. */
+  hostIp?: string;
+  protocol?: string;
+}
+
+/**
+ * Resolves the merged Compose configuration and extracts ONLY each
+ * service's declared `ports:` entries (never bind mounts, volumes, or
+ * environment — see `resolveComposePersistence` for those). Read-only and
+ * safe at any time: it runs `docker compose config`, which requires the
+ * `docker compose` CLI but not a running daemon, and creates nothing.
+ *
+ * This is the STATIC half of this sub-issue's port-exposure proof — it
+ * confirms what Compose WOULD publish for a given environment, before any
+ * container exists. See `getContainerHostPortBindings` below for the
+ * matching RUNTIME half (the actual bindings an already-running container
+ * was created with).
+ */
+export async function resolveComposePublishedPorts(project: ComposeProject, env: ComposeEnv): Promise<Record<string, ResolvedComposePort[]>> {
+  const args = composeArgs(project, ["config", "--format", "json"]);
+  const result = await runToCompletion("docker", args, { cwd: project.cwd, env: withEnv(env), timeoutMs: 60000 });
+  if (result.exitCode !== 0) {
+    throw new Error(`docker compose config --format json failed (exit ${result.exitCode}):\n${result.stderr}`);
+  }
+
+  const parsed = JSON.parse(result.stdout) as {
+    services?: Record<string, { ports?: { target?: number; published?: string; host_ip?: string; protocol?: string }[] }>;
+  };
+
+  const out: Record<string, ResolvedComposePort[]> = {};
+  for (const [serviceName, service] of Object.entries(parsed.services ?? {})) {
+    out[serviceName] = (service.ports ?? []).map((entry) => ({
+      target: entry.target ?? 0,
+      published: entry.published,
+      hostIp: entry.host_ip,
+      protocol: entry.protocol,
+    }));
+  }
+  return out;
+}
+
+/** One host-port binding for a container, as `docker inspect`'s `HostConfig.PortBindings` reports it. */
+export interface ContainerPortBinding {
+  hostIp: string;
+  hostPort: string;
+}
+
+/**
+ * The actual host-port bindings `service`'s container was CREATED with —
+ * `docker inspect`'s `HostConfig.PortBindings`, keyed by `"<containerPort>/<protocol>"`
+ * (e.g. `"80/tcp"`). Deliberately reads `HostConfig.PortBindings`, not
+ * `NetworkSettings.Ports`: the latter only reflects ACTIVE bindings while a
+ * container is running and can read back empty for an already-exited
+ * container (e.g. `migrate-control`/`migrate-project`, which exit quickly),
+ * even though its publish configuration is unchanged — `HostConfig.PortBindings`
+ * is fixed at container-creation time and is therefore accurate whether the
+ * container is running, exited, or stopped.
+ *
+ * A container that declares no `ports:` at all resolves to `{}` (Docker
+ * never adds an EXPOSE-only port here — only an explicit publish does),
+ * which is exactly the proof this sub-issue needs for `api`/`web`/`postgres`/
+ * `worker`/the migration services: no host port exposure, regardless of
+ * what the image itself exposes internally.
+ *
+ * Works on an already-exited container too (uses `getContainerId`'s own
+ * `-a` lookup) — required for the one-shot migration services.
+ */
+export async function getContainerHostPortBindings(project: ComposeProject, service: string): Promise<Record<string, ContainerPortBinding[] | null>> {
+  const containerId = await getContainerId(project, service);
+  if (!containerId) {
+    throw new Error(`No container found for service "${service}" in project ${project.projectName}`);
+  }
+  const inspect = await runToCompletion("docker", ["inspect", containerId, "--format", "{{json .HostConfig.PortBindings}}"], {
+    timeoutMs: 15000,
+  });
+  if (inspect.exitCode !== 0) {
+    throw new Error(`docker inspect "${containerId}" failed (exit ${inspect.exitCode}):\n${inspect.stderr}`);
+  }
+  const raw = JSON.parse(inspect.stdout.trim() || "null") as Record<string, { HostIp: string; HostPort: string }[] | null> | null;
+  if (!raw) return {};
+  const result: Record<string, ContainerPortBinding[] | null> = {};
+  for (const [portKey, bindings] of Object.entries(raw)) {
+    result[portKey] = bindings ? bindings.map((binding) => ({ hostIp: binding.HostIp, hostPort: binding.HostPort })) : null;
+  }
+  return result;
+}
+
+/**
+ * Whether `hostIp` is a genuinely loopback-only bind address. ONLY
+ * `"127.0.0.1"` qualifies — never a wildcard (`"0.0.0.0"`, `"::"`), never
+ * the empty string (Docker's own shorthand for "every interface," the same
+ * as `0.0.0.0`), and never IPv6 loopback `"::1"` either, since this
+ * stack's own published services are always configured with the literal
+ * IPv4 loopback address (see docker-compose.yml) — accepting `::1` here
+ * too would let a silent IPv6-wildcard regression (`::`, which Linux can
+ * map to dual-stack `0.0.0.0`-like exposure) pass unnoticed.
+ *
+ * Pure and synchronous — independently unit-testable with synthetic
+ * values, no Docker required. Used to validate BOTH the static resolved
+ * configuration (`resolveComposePublishedPorts`) and real running
+ * containers' bindings (`getContainerHostPortBindings`).
+ */
+export function isLoopbackOnlyHostIp(hostIp: string | undefined): boolean {
+  return hostIp === "127.0.0.1";
+}
+
+/**
+ * Asserts every binding in `bindings` (as returned by
+ * `getContainerHostPortBindings` or adapted from `resolveComposePublishedPorts`)
+ * is loopback-only, throwing with the exact offending port/address
+ * otherwise. `context` names what is being checked, for a readable
+ * failure. A service with no bindings at all (`{}`) trivially passes —
+ * this function only rejects a genuinely unsafe PUBLISHED binding, never
+ * the absence of one.
+ */
+export function assertLoopbackOnlyBindings(bindings: Record<string, ContainerPortBinding[] | null>, context: string): void {
+  for (const [portKey, list] of Object.entries(bindings)) {
+    if (!list) continue;
+    for (const binding of list) {
+      if (!isLoopbackOnlyHostIp(binding.hostIp)) {
+        throw new Error(
+          `${context}: port ${portKey} is published on host address "${binding.hostIp}", not loopback-only ("127.0.0.1") — ` +
+            `this is a wildcard or otherwise non-loopback bind, exposing the service beyond the local host.`,
+        );
+      }
+    }
+  }
 }
