@@ -585,6 +585,172 @@ describe("cleanupDisposableTargets — partial setup and per-target ownership re
   });
 });
 
+// Regression coverage for a review finding on sub-issue 02.04:
+// proxy-health.test.ts and port-exposure.test.ts now build their cleanup
+// via `createComposeCleanupTarget` + `cleanupDisposableTargets` (the same
+// guarded contract `persistence.test.ts` uses — see this file's own
+// header comment for why the NEGATIVE ownership/discovery paths are
+// proven here, with fakes, rather than against a real volume). These
+// cases mirror those two files' own project shapes specifically —
+// proxy-health.test.ts starts only `nginx`/`web`/`api` (no volume is
+// actually expected to exist), port-exposure.test.ts's runtime suite
+// starts the full stack (both `postgres-data`/`storage-data` really
+// exist) — proving the SAME guard rejects destructive cleanup for both
+// shapes when ownership is unsafe or discovery itself fails.
+describe("guarded cleanup for the 02.04 proxy-health/port-exposure call sites — unsafe ownership or failed discovery blocks destruction", () => {
+  function fakeGuardedTarget(options: {
+    label: string;
+    resolveConfiguredVolumeNames: () => Promise<string[]>;
+    listLabeledVolumeNames: () => Promise<string[]>;
+    inspectVolumeByName: (name: string) => Promise<VolumeOwnership | undefined>;
+    context: VolumeOwnershipContext;
+  }): DisposableCleanupTarget & { keepCalls: number; destroyCalls: number } {
+    const calls = { keep: 0, destroy: 0 };
+    return {
+      label: options.label,
+      discoverVolumes: () =>
+        discoverVolumesRequiringInspection({
+          resolveConfiguredVolumeNames: options.resolveConfiguredVolumeNames,
+          listLabeledVolumeNames: options.listLabeledVolumeNames,
+          inspectVolumeByName: options.inspectVolumeByName,
+        }),
+      ownershipContext: options.context,
+      removeContainersKeepingVolumes: async () => {
+        calls.keep += 1;
+      },
+      removeContainersAndVolumes: async () => {
+        calls.destroy += 1;
+      },
+      get keepCalls() {
+        return calls.keep;
+      },
+      get destroyCalls() {
+        return calls.destroy;
+      },
+    };
+  }
+
+  it("proxy-health.test.ts's shape — a FAILED configuration resolution (e.g. 'docker compose config' itself failing) fails closed and never destroys anything", async () => {
+    const target = fakeGuardedTarget({
+      label: "relis-proxy-health-aaaa1111",
+      resolveConfiguredVolumeNames: async () => {
+        throw new Error("docker compose config --format json failed (exit 1)");
+      },
+      listLabeledVolumeNames: async () => [],
+      inspectVolumeByName: async () => fakeVolumeOwnership(),
+      context: { expectedProjectName: "relis-proxy-health-aaaa1111", baselineVolumeNames: [], externalVolumeKeys: [] },
+    });
+
+    const [outcome] = await cleanupDisposableTargets([target]);
+    expect(outcome.error).toMatch(/docker compose config.*failed/i);
+    expect(outcome.volumesDeleted).toEqual([]);
+    expect(target.destroyCalls).toBe(0);
+    // Setup never completed, so even the safe containers-only removal is
+    // never attempted for this target either — there is nothing it owns
+    // to clean up.
+    expect(target.keepCalls).toBe(0);
+  });
+
+  it("proxy-health.test.ts's shape — neither postgres-data nor storage-data was ever created (both CONFIRMED absent): cleanup proceeds safely with nothing to delete", async () => {
+    const projectName = "relis-proxy-health-bbbb2222";
+    const target = fakeGuardedTarget({
+      label: projectName,
+      resolveConfiguredVolumeNames: async () => [`${projectName}_postgres-data`, `${projectName}_storage-data`],
+      listLabeledVolumeNames: async () => [],
+      inspectVolumeByName: async () => undefined,
+      context: { expectedProjectName: projectName, baselineVolumeNames: [], externalVolumeKeys: [] },
+    });
+
+    const [outcome] = await cleanupDisposableTargets([target]);
+    expect(outcome.volumesDeleted).toEqual([]);
+    expect(outcome.volumesRequiringManualInspection).toEqual([]);
+    // A CONFIRMED absence is never a reason to block the destructive
+    // step — there is simply nothing there to delete or protect.
+    expect(target.destroyCalls).toBe(1);
+    expect(target.keepCalls).toBe(0);
+  });
+
+  it("port-exposure.test.ts's shape — a MISLABELED postgres-data (real daemon volume, wrong/missing Compose project label) REFUSES the destructive step for the whole target", async () => {
+    const projectName = "relis-port-runtime-cccc3333";
+    const postgresDataName = `${projectName}_postgres-data`;
+    const storageDataName = `${projectName}_storage-data`;
+    const target = fakeGuardedTarget({
+      label: projectName,
+      resolveConfiguredVolumeNames: async () => [postgresDataName, storageDataName],
+      listLabeledVolumeNames: async () => [storageDataName],
+      inspectVolumeByName: async (name) => {
+        if (name === postgresDataName) {
+          // Exists physically (Compose created it, by name) but its
+          // ownership label does not match this disposable project —
+          // exactly the "mislabeled or relabeled volume" scenario
+          // `discoverVolumesRequiringInspection`'s union is meant to
+          // still catch, even though label-based discovery alone missed it.
+          return fakeVolumeOwnership({ name: postgresDataName, composeProject: "someone-elses-dev-stack", composeVolumeKey: "postgres-data" });
+        }
+        return fakeVolumeOwnership({ name: storageDataName, composeProject: projectName, composeVolumeKey: "storage-data" });
+      },
+      context: { expectedProjectName: projectName, baselineVolumeNames: [], externalVolumeKeys: [] },
+    });
+
+    const [outcome] = await cleanupDisposableTargets([target]);
+    expect(outcome.volumesDeleted).toEqual([]);
+    expect(outcome.volumesRequiringManualInspection).toEqual([
+      { name: postgresDataName, reason: expect.stringContaining("someone-elses-dev-stack") },
+    ]);
+    // The destructive command is NEVER called for this target — only the
+    // safe, containers-only removal runs, for BOTH volumes together
+    // (ownership is all-or-nothing per target).
+    expect(target.destroyCalls).toBe(0);
+    expect(target.keepCalls).toBe(1);
+  });
+
+  it("port-exposure.test.ts's shape — storage-data already existed on the daemon before this run (the baseline) REFUSES destruction even though postgres-data is genuinely owned", async () => {
+    const projectName = "relis-port-runtime-dddd4444";
+    const postgresDataName = `${projectName}_postgres-data`;
+    const storageDataName = `${projectName}_storage-data`;
+    const target = fakeGuardedTarget({
+      label: projectName,
+      resolveConfiguredVolumeNames: async () => [postgresDataName, storageDataName],
+      listLabeledVolumeNames: async () => [postgresDataName, storageDataName],
+      inspectVolumeByName: async (name) =>
+        fakeVolumeOwnership({ name, composeProject: projectName, composeVolumeKey: name === postgresDataName ? "postgres-data" : "storage-data" }),
+      context: { expectedProjectName: projectName, baselineVolumeNames: [storageDataName], externalVolumeKeys: [] },
+    });
+
+    const [outcome] = await cleanupDisposableTargets([target]);
+    expect(outcome.volumesDeleted).toEqual([]);
+    expect(outcome.volumesRequiringManualInspection).toEqual([{ name: storageDataName, reason: expect.stringMatching(/pre-existing/i) }]);
+    expect(target.destroyCalls).toBe(0);
+    expect(target.keepCalls).toBe(1);
+  });
+
+  it("port-exposure.test.ts's shape — an INSPECTION FAILURE for one volume (daemon unreachable mid-discovery) REFUSES destruction for the whole target, never reading it as absence", async () => {
+    const projectName = "relis-port-runtime-eeee5555";
+    const postgresDataName = `${projectName}_postgres-data`;
+    const storageDataName = `${projectName}_storage-data`;
+    const target = fakeGuardedTarget({
+      label: projectName,
+      resolveConfiguredVolumeNames: async () => [postgresDataName, storageDataName],
+      listLabeledVolumeNames: async () => [postgresDataName, storageDataName],
+      inspectVolumeByName: async (name) => {
+        if (name === storageDataName) {
+          throw new Error("daemon unreachable while inspecting storage-data");
+        }
+        return fakeVolumeOwnership({ name: postgresDataName, composeProject: projectName, composeVolumeKey: "postgres-data" });
+      },
+      context: { expectedProjectName: projectName, baselineVolumeNames: [], externalVolumeKeys: [] },
+    });
+
+    const [outcome] = await cleanupDisposableTargets([target]);
+    expect(outcome.volumesDeleted).toEqual([]);
+    expect(outcome.volumesRequiringManualInspection).toEqual([
+      { name: storageDataName, reason: expect.stringContaining("daemon unreachable while inspecting storage-data") },
+    ]);
+    expect(target.destroyCalls).toBe(0);
+    expect(target.keepCalls).toBe(1);
+  });
+});
+
 describe("parseS3ErrorBody / isS3ObjectAbsent — a specific S3 'not found', never merely 'any error'", () => {
   const NO_SUCH_KEY_BODY =
     '<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>';

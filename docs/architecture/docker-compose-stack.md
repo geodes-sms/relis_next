@@ -2,10 +2,13 @@
 
 Implements local sub-issues [02.02 — Define services and shared
 configuration, including the Control DB and per-project test
-databases](../../../context/notion-tasks/sub-issues/02-02.md) and
+databases](../../../context/notion-tasks/sub-issues/02-02.md),
 [02.03 — Configure local persistent volumes and exclude them from version
-control](../../../context/notion-tasks/sub-issues/02-03.md) (parent: [02
-— Add Docker Compose local stack](../../../context/notion-tasks/02-docker-compose.md)).
+control](../../../context/notion-tasks/sub-issues/02-03.md), and
+[02.04 — Expose health/readiness through the local proxy and restrict
+database and storage port exposure](../../../context/notion-tasks/sub-issues/02-04.md)
+(parent: [02 — Add Docker Compose local
+stack](../../../context/notion-tasks/02-docker-compose.md)).
 Builds directly on [the local-stack inventory](local-stack-inventory.md)
 from the preceding sub-issue — read that document first for the
 application startup contracts this stack reuses unchanged (it does not
@@ -130,6 +133,79 @@ how to recreate the stack afterward.
   existing `API_CORS_ORIGIN` setting (still configured, defensively, as
   `http://localhost:${NGINX_HTTP_PORT}`) is not actually exercised in
   normal use.
+
+## Health and readiness — verified URLs and their actual meaning
+
+Implements local sub-issue [02.04](../../../context/notion-tasks/sub-issues/02-04.md).
+Every URL below is reached through the proxy only — `apps/api`'s own port
+(`3001`) is never published to the host (see "Host port exposure policy"
+below).
+
+| URL | Reaches | Meaning — verified by reading the actual route/behavior, not assumed |
+| --- | --- | --- |
+| `http://127.0.0.1:${NGINX_HTTP_PORT:-8080}/nginx-health` | nginx itself (not proxied — a dedicated `location` in `docker/nginx/nginx.conf`) | **Proxy liveness only.** Always `200 ok` whenever the nginx process is up, regardless of whether `web`/`api` are reachable. **Never treat this as application readiness** — `proxy-health.test.ts` proves it stays `200 ok` even while the `api` upstream is stopped. |
+| `http://127.0.0.1:${NGINX_HTTP_PORT:-8080}/api/health` | `apps/api`'s existing `GET /health` (`apps/api/src/app.ts`), via the `/api/` prefix (stripped by nginx) | `200 {"status":"ok","message":"...","service":"api"}` whenever the API process can respond at all. Not a dependency check of any kind. |
+| `http://127.0.0.1:${NGINX_HTTP_PORT:-8080}/api/ready` | `apps/api`'s existing `GET /ready` | `200 {"status":"ok","service":"api","checks":{"network":"ok","cors":"ok"}}`. This is the **entire, existing** readiness contract — it reports only that the process itself initialized its network/CORS configuration. It does **not** check PostgreSQL, the worker, or any queue, because `apps/api` has no such dependency in code today. `dependency-unavailable.test.ts` proves this stays `"ok"` even with `postgres` stopped — a documented limitation, not a bug introduced by this sub-issue. No database-readiness semantics are invented here. |
+
+### Behavior when the API upstream itself is unreachable
+
+**Verified by real execution** (`proxy-health.test.ts`): stopping `api`
+(`docker compose stop api`, the upstream nginx proxies to — distinct from
+stopping a *downstream* dependency of the API, which is what
+`dependency-unavailable.test.ts` covers instead) does **not** produce an
+instant failure. `docker/nginx/nginx.conf`'s `proxy_pass http://api:3001/;`
+uses a static hostname, so nginx resolves and caches that hostname's IP
+once, at nginx's own startup, and does not re-resolve per request. After
+`api` stops, nginx's cached route to it is dead, and packets toward it are
+dropped rather than refused — so nginx hits its own default
+`proxy_connect_timeout` (60s; not overridden in this minimal dev config)
+before responding `504 Gateway Timeout`. Either way, the response:
+
+- Is always a `5xx`, never a false `200`.
+- Is never `apps/web`'s rendered homepage — the browser-facing `/` route
+  and the `/api/` route fail independently of each other, proved by `web`
+  staying reachable (`200`) throughout the same test.
+- Never causes `/nginx-health` to report anything other than `200 ok` —
+  proxy liveness and application readiness are, and must stay, unrelated
+  signals.
+
+Restarting the upstream (`docker compose start api`) is observed to
+recover within the existing success contract above, confirmed by bounded
+polling (`waitForHttpStatus`, `packages/test-utils/src/docker-compose.ts`) —
+not merely asserted from the restart command's own exit code.
+
+## Host port exposure policy
+
+Implements local sub-issue [02.04](../../../context/notion-tasks/sub-issues/02-04.md),
+building on the service graph above.
+
+- **`api`, `web`, `postgres`, `worker`, `migrate-control`, `migrate-project`
+  publish NO host port at all.** They declare no `ports:` entry in
+  `docker-compose.yml`, and `port-exposure.test.ts` confirms this at both
+  the resolved `docker compose config` level and against real (or, for the
+  two one-shot migration services, real-but-already-exited) containers'
+  `docker inspect`-reported `HostConfig.PortBindings` — not merely the
+  static file, and not merely "the container didn't crash."
+- **`nginx`, `mailhog` (UI only), and `storage` (S3 gateway only) are the
+  only approved host-published development endpoints, and every one binds
+  to `127.0.0.1` — loopback — only.** Never `0.0.0.0`, never `::`, never an
+  unspecified host IP (Docker's own shorthand for "every interface").
+  `port-exposure.test.ts` asserts this against the real running
+  containers' actual bindings, not just the compose file's intent.
+- **SMTP (`mailhog:1025`) and the storage administration ports (SeaweedFS
+  master `:9333`, filer `:8888`) are never published.** No application
+  mail or storage adapter exists yet to use them from outside the Compose
+  network (see "Known limitations"), and nothing in this sub-issue adds
+  one.
+- **Docker's internal bridge network is not, and is never claimed to be, a
+  security boundary against the host administrator.** Isolating
+  container-to-container traffic on the `relis` network keeps *other
+  containers on a different Compose project* from reaching `api`/`postgres`/
+  `worker` directly, but anyone with access to the Docker daemon on this
+  host (another `docker run --network`, `docker exec`, etc.) can still
+  reach any internal service regardless of whether it publishes a host
+  port. The loopback-only publish rule above is the actual, and only,
+  host-facing boundary this sub-issue establishes and verifies.
 
 ## Clean-checkout startup
 
@@ -534,6 +610,59 @@ endpoint through nginx.
   streams checked for a leaked raw value. `-T` (no pseudo-TTY) is required
   for `docker compose run` to keep stdout/stderr separate at all; without
   it they would be merged into one stream.
+- `proxy-health.test.ts` — implements local sub-issue
+  [02.04](../../../context/notion-tasks/sub-issues/02-04.md)'s AC1. Brings
+  up only `nginx` (which pulls in `web`/`api` via `depends_on`) and
+  verifies, against the real stack: `/api/health`/`/api/ready` preserve
+  `apps/api`'s existing status codes and bodies through the proxy;
+  `/nginx-health` stays `200 ok` independent of the API's own readiness;
+  stopping `api` makes the proxy respond `5xx` (observed: `504`, after
+  nginx's own default 60s `proxy_connect_timeout` against its cached,
+  now-dead upstream route — see "Health and readiness" above) and never a
+  false `200` or the web page, while `/` (served by the untouched `web`
+  container) and `/nginx-health` keep working; and restarting `api`
+  recovers within the existing success contract, confirmed by bounded
+  polling (`waitForHttpStatus`). Setup/teardown follow the SAME guarded
+  lifecycle contract as `persistence.test.ts` (sub-issue 02.03) — see
+  "Cleanup robustness" below — even though this suite's own services
+  (`nginx`/`web`/`api`) are not expected to create either named volume.
+- `port-exposure.test.ts` — implements local sub-issue
+  [02.04](../../../context/notion-tasks/sub-issues/02-04.md)'s AC2 at three
+  layers: (1) pure, Docker-free unit tests of the loopback-only validation
+  logic itself (`isLoopbackOnlyHostIp`/`assertLoopbackOnlyBindings`),
+  including the explicit negative cases this sub-issue calls for —
+  synthetic `0.0.0.0`, `::`, and empty-string bindings are all REJECTED —
+  proving the validation logic only, never presented as real networking
+  evidence; (2) the RESOLVED `docker compose config --format json` output
+  (`resolveComposePublishedPorts`), asserting `api`/`web`/`postgres`/
+  `worker`/`migrate-control`/`migrate-project` declare no `ports:` at all,
+  and `nginx`/`mailhog`/`storage` declare exactly their approved,
+  loopback-bound port and nothing else (never SMTP `1025`, never storage
+  admin `9333`/`8888`); (3) the REAL running (or, for the one-shot
+  migration services, real-but-exited) containers' own `docker inspect`
+  `HostConfig.PortBindings` (`getContainerHostPortBindings`) — the actual
+  runtime evidence the resolved configuration alone cannot provide,
+  confirming every service matches layer (2) in practice. Layer (3) brings
+  up the full stack, including `postgres`/`storage` (which DO create this
+  project's two real named volumes), so its setup/teardown use the SAME
+  guarded lifecycle contract as `persistence.test.ts` — baseline capture,
+  `assertProvisioningSafety` before `up`, and `createComposeCleanupTarget`
+  + `cleanupDisposableTargets` in `afterAll` (see "Cleanup robustness"
+  below) — rather than an unguarded `cleanupComposeProject`.
+- `wait-for-http-status.test.ts` — deterministic, Docker-free regression
+  coverage for `waitForHttpStatus` itself (used by `proxy-health.test.ts`'s
+  recovery check above), against a real local `node:http` server
+  (loopback, ephemeral port — never an external service): resolves on an
+  acceptable status, retries past repeated unacceptable ones and recovers,
+  times out reporting the last observed status, and — the regression this
+  file exists for — stays genuinely BOUNDED by `timeoutMs` even when a
+  single request hangs and never responds at all (an earlier version only
+  checked the deadline *between* requests, so one hanging request could
+  keep the whole wait open indefinitely — exactly the shape of nginx's own
+  60s `proxy_connect_timeout` behavior documented above). A dedicated case
+  confirms the pending request is actually cancelled at the network level
+  (observed via the test server's own `req.on("close")`), not merely that
+  the calling promise gives up locally.
 - `dependency-unavailable.test.ts` — explicitly starts `postgres` (plus
   `nginx`/`api`; an earlier version only requested `["nginx"]`, which
   never actually started `postgres` at all, since nothing in nginx's own
@@ -643,6 +772,26 @@ separate failure, not a replacement for one already recorded. Every
 cleanup call is still scoped to exactly its own uniquely-named project
 (`docker compose -p <project> down --volumes --remove-orphans`), never
 touching another project's containers, network, or volumes.
+
+`proxy-health.test.ts` and `port-exposure.test.ts` (sub-issue 02.04) use
+the FULLER guarded contract instead — the same one `persistence.test.ts`
+uses (below): a volume baseline captured before anything is provisioned,
+`assertProvisioningSafety` checked before `composeUp`, and
+`createComposeCleanupTarget` + `cleanupDisposableTargets` in `afterAll`
+(re-resolving the exact configured volume names fresh and re-verifying
+ownership immediately before any deletion, failing closed on a discovery
+failure, and falling back to a containers-only removal — never the
+destructive one — when ownership cannot be established). An earlier
+version of both files called `cleanupComposeProject` directly, bypassing
+this contract; `persistence-safety.test.ts` now also carries fakes-based
+regression coverage, shaped specifically after these two files' own
+projects (a `nginx`/`web`/`api`-only project with no volume expected to
+exist, and a full-stack project that genuinely owns `postgres-data`/
+`storage-data`), proving a failed discovery or an unsafe ownership check
+(mislabeled, pre-existing/baseline, or an inspection failure) still blocks
+the destructive step for either shape — never exercised against a real
+volume, for the same reason `persistence.test.ts` itself doesn't (see that
+file's own header comment).
 `config-validation.test.ts` previously had no cleanup step at all, even
 though `composeRun`'s `--rm` only removes the one-off container it
 creates — the project's implicitly-created network (Compose creates this
