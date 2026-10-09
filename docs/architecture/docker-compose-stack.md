@@ -4,9 +4,12 @@ Implements local sub-issues [02.02 — Define services and shared
 configuration, including the Control DB and per-project test
 databases](../../../context/notion-tasks/sub-issues/02-02.md),
 [02.03 — Configure local persistent volumes and exclude them from version
-control](../../../context/notion-tasks/sub-issues/02-03.md), and
+control](../../../context/notion-tasks/sub-issues/02-03.md),
 [02.04 — Expose health/readiness through the local proxy and restrict
-database and storage port exposure](../../../context/notion-tasks/sub-issues/02-04.md)
+database and storage port exposure](../../../context/notion-tasks/sub-issues/02-04.md),
+and [02.05 — Document startup, diagnostics, and local access to
+MailHog/Mailpit and job
+observability](../../../context/notion-tasks/sub-issues/02-05.md)
 (parent: [02 — Add Docker Compose local
 stack](../../../context/notion-tasks/02-docker-compose.md)).
 Builds directly on [the local-stack inventory](local-stack-inventory.md)
@@ -49,20 +52,78 @@ read by any application code) instead of a dedicated compose file — see
 
 ## Prerequisites
 
-- Docker Engine with the Compose V2 CLI plugin (the `docker compose`
-  subcommand, not the legacy standalone `docker-compose` V1 binary), with
-  a Linux-container backend. **Verified by real execution** (Docker
-  Desktop 29.8.2 / `docker compose` plugin v5.5.1, Windows host,
-  WSL2/Linux-container engine) — see the final report for sub-issue #47
-  for the exact commands and results. Earlier drafts of this document
-  were written before Docker was available and said so explicitly; that
-  caveat no longer applies.
-- No `pnpm`/Node install needed on the host — every app container installs
-  its own dependencies at image-build time (`pnpm install --frozen-lockfile`
-  against the committed `pnpm-lock.yaml`).
+Implements local sub-issue [02.05](../../../context/notion-tasks/sub-issues/02-05.md)'s
+"reproducible startup" requirement. What you actually need depends on
+which of the two local-development paths you're using — this repository
+has **two independent** ones (see `README.md` "Docker Compose (local
+stack)" vs. its earlier "Deployment"/native sections): running the Docker
+Compose stack below, or running tests/applications directly on the host
+(`pnpm dev`, `pnpm test`, `pnpm run test:e2e`, `node tooling/scripts/deploy.mjs`).
+
+| | Docker-only startup (`docker compose up`) | Running tests or applications directly on the host |
+| --- | --- | --- |
+| Docker Engine + Compose V2 plugin | **Required.** | Required only for `pnpm run test:integration` (and the integration suites under `tests/integration/docker-compose/`), which spawn real disposable Compose projects. Not required for `pnpm -r test` (package unit suites) or running an app's own `dev`/`start` natively. |
+| Node.js | **Not required on the host at all.** Each of `web`/`api`/`worker`'s images installs its own Node 22 runtime (`node:22-bookworm-slim` — see each `docker/*/Dockerfile`'s `FROM` line) and its own dependencies at **image-build time** (`pnpm install --frozen-lockfile` against the committed `pnpm-lock.yaml`, inside the container). | **Required**, matching this repository's own `package.json` `engines.node` field: `>=22.15`. |
+| pnpm | Not required on the host — each image installs its own pnpm via Corepack during the build. | **Required**, pinned exactly by `package.json`'s `packageManager` field: `pnpm@11.17.0`. |
+| Playwright's Chromium browser | Not required unless you also run `tests/e2e/docker-compose/` (below). | Required only for `pnpm run test:e2e` — install explicitly with `pnpm exec playwright install chromium` (this repository's tooling never installs it on your behalf automatically). |
+
+(Versions above are read directly from this repository's own
+`package.json`/Dockerfiles, not invented — re-check those files if this
+document and the code ever disagree.) Docker Engine itself, the Compose
+plugin, and a Linux-container backend are **verified by real execution**
+in the environment used for this sub-issue's own verification pass
+(`docker --version` → Docker Engine `29.8.2`; `docker compose version` →
+Compose plugin `v5.5.1`; Windows host, WSL2/Linux-container engine) — the
+exact versions your own host reports may differ; what matters is the
+Compose **V2** CLI plugin (the `docker compose` subcommand), never the
+legacy standalone `docker-compose` V1 binary, with a Linux-container
+backend (Windows containers are not supported here).
+
 - Copy `.env.example` to `.env` at the repository root (same convention as
   the existing runtime-config setup — see `README.md` "Runtime
-  configuration"). Every value in it is a development-only placeholder.
+  configuration"). Every value in it is a development-only placeholder,
+  safe to commit as an example and safe to use unmodified for ordinary
+  local development.
+
+### Compose interpolation vs. application environment loading — two SEPARATE mechanisms
+
+This root `.env` file and `@relis/config`'s own `loadEnvFiles` (documented
+in `README.md` "Environment loading and override precedence") are **not
+the same mechanism**, and confusing them is the single most common source
+of "I changed `.env` but nothing happened" confusion with this stack:
+
+- **Compose interpolation** (what the root `.env` actually feeds): `docker
+  compose` itself reads `.env` from the current directory **on the host**,
+  purely to resolve `${VAR:-default}` placeholders written directly in
+  `docker-compose.yml` — e.g. `POSTGRES_USER`, `POSTGRES_PASSWORD`,
+  `NGINX_HTTP_PORT`, `MAILHOG_UI_PORT`, `SEAWEEDFS_S3_PORT`,
+  `PROJECT_TEST_DB_NAME`. This happens entirely before any container
+  starts, and the resolved values are then baked into each service's
+  `environment:` block as literal values.
+- **Application environment loading** (`@relis/config`'s `loadEnvFiles`,
+  used by `apps/api`/`apps/web`/`apps/worker`'s own entry points): reads
+  `.env*` files from **inside the running process's own filesystem** —
+  the application root and the owning package directory. Verified by
+  direct inspection of this repository's build context: `.dockerignore`
+  explicitly excludes `.env`/`.env.*` (keeping only `.env.example`) from
+  every image's build context, and no service in `docker-compose.yml`
+  declares an `env_file:` directive or bind-mounts the root `.env` into
+  any container. **The root `.env` file therefore never reaches
+  `loadEnvFiles` inside any of the three app containers at all** — every
+  value that process needs (`NODE_ENV`, `API_PORT`, `API_HOST`,
+  `API_CORS_ORIGIN`, `WEB_PORT`, `NEXT_PUBLIC_API_URL`) is instead set
+  directly as a literal in that service's own `environment:` block in
+  `docker-compose.yml` (itself possibly built from a Compose-interpolated
+  value, e.g. `NEXT_PUBLIC_API_URL: http://localhost:${NGINX_HTTP_PORT:-8080}/api`
+  — one mechanism feeding the other, not the same mechanism twice).
+- **Consequence:** adding a NEW variable to your root `.env` and expecting
+  `apps/api`/`apps/web`/`apps/worker` to see it via `loadEnvFiles` **will
+  not work** inside this Compose stack — it would only work for a
+  natively-run process (`pnpm --filter "./apps/api" dev`, outside Docker).
+  To change what a containerized service's OWN code sees, add or change
+  it in that service's `environment:` block in `docker-compose.yml`
+  (optionally still sourced from a Compose-interpolated `${VAR}`).
+
 - Only for the real-browser check (`tests/e2e/docker-compose/`):
   Playwright's Chromium browser binary must be installed
   (`pnpm exec playwright install chromium`). **Now installed and
@@ -75,15 +136,117 @@ read by any application code) instead of a dedicated compose file — see
 ## Startup
 
 ```bash
+cd relis                 # the application root — every command below assumes this working directory
+cp .env.example .env     # once, if not already done
 docker compose up --build
 ```
 
-First run builds `web`, `api`, and `worker`'s images (each installs the
-full pnpm workspace and bakes an initial `@relis/config` build — see
-"Clean-checkout startup" below) and provisions two disposable PostgreSQL
-databases via the `migrate-control` / `migrate-project` one-shot services.
-Subsequent runs can drop `--build` unless `package.json`/`pnpm-lock.yaml`
-changed.
+First run pulls four base images (`postgres:17-alpine`, `nginx:1.27-alpine`,
+`mailhog/mailhog:v1.0.1`, `chrislusf/seaweedfs:3.71` — all **verified to
+pull successfully** during this and earlier sub-issues' real
+verification) and builds `web`, `api`, and `worker`'s own three images
+locally, each of which installs the full pnpm workspace and bakes an
+initial `@relis/config` build (see "Clean-checkout startup" below). How
+long this takes is **not something this document promises a fixed
+duration for** — it depends on your network speed (image pulls, registry
+reachability) and host CPU/disk speed (three `pnpm install
+--frozen-lockfile` runs), and Docker's own layer cache means a *second*
+run of this exact command, even after `git clean`-ing the working tree,
+can be meaningfully faster than the first if the underlying Dockerfile
+layers haven't changed. Subsequent runs can drop `--build` unless
+`package.json`/`pnpm-lock.yaml` changed.
+
+### What a successful startup actually looks like
+
+Verified by real execution — one real `docker compose up -d --build` run
+against a uniquely-named disposable project during this sub-issue's own
+verification pass (see "Verification" in the completion report; `ps`
+output trimmed to the relevant columns):
+
+```
+NAME        STATUS                             PORTS
+api         Up 18 seconds (healthy)            3001/tcp
+mailhog     Up 17 seconds                      127.0.0.1:<MAILHOG_UI_PORT>->8025/tcp
+nginx       Up 16 seconds (healthy)             127.0.0.1:<NGINX_HTTP_PORT>->80/tcp
+postgres    Up 17 seconds (healthy)             5432/tcp
+storage     Up 18 seconds (health: starting)   127.0.0.1:<SEAWEEDFS_S3_PORT>->8333/tcp
+web         Up 17 seconds (healthy)             3000/tcp
+worker      Up 17 seconds                       (no port, no health column at all)
+```
+
+A few seconds later, `storage` converges to `(healthy)` too (its
+healthcheck has a `start_period` — see "Known limitations" for the two
+real healthcheck defects already found and fixed here). `migrate-control`
+and `migrate-project` are **not** in this list at all once they've
+finished — `docker compose ps` (with no `-a`) only shows currently-running
+containers, and both are one-shot services that **exit** on success:
+
+```bash
+docker compose -p relis -f docker-compose.yml ps -a migrate-control migrate-project
+# STATUS column reads "Exited (0) ..." for both once provisioning succeeds
+```
+
+Three distinct "no health information" shapes exist, by design, and all
+three are expected — **none of them is a failure**:
+
+- `worker` has **no `healthcheck:` block at all** in `docker-compose.yml`
+  (deliberately — see "Job observability" below for why fabricating one
+  would misrepresent what this service actually does) — its `ps` row
+  shows no health annotation.
+- `mailhog` **has no `healthcheck:` block either** (its official image is
+  a near-scratch Go binary with no shell/`wget` bundled — see "Known
+  limitations") — same bare "Up ..." row, no health annotation.
+- `migrate-control`/`migrate-project` have no `healthcheck:` either, but
+  for a different reason: they are not long-running services to probe —
+  success is their own process exiting `0`.
+
+Through the proxy, immediately after `nginx` itself reports `(healthy)`.
+**Discover the actual published address first — never assume
+`localhost:8080`.** `NGINX_HTTP_PORT:-8080` is a default written directly
+inside `docker-compose.yml`; it is resolved by `docker compose` itself
+from the root `.env` file (see "Compose interpolation vs. application
+environment loading" above), which your shell has **no visibility into
+at all** unless you've explicitly exported it there yourself. A shell
+expression like `${NGINX_HTTP_PORT:-8080}` in your OWN terminal reads
+your shell's environment, not `.env` — if `.env` sets a different port
+and that variable was never exported into your shell, the expression
+silently falls back to the literal `8080`, which may not be published at
+all (**verified by real execution**: with `NGINX_HTTP_PORT=19234` set
+only in `.env`, a fresh shell's `${NGINX_HTTP_PORT:-8080}` still resolved
+to `8080`, and a request to that address failed to connect — nothing was
+listening there). Ask Docker for the real, currently-published address
+instead, then use exactly that in every probe below:
+
+**Bash:**
+
+```bash
+NGINX_ADDR=$(docker compose -p relis -f docker-compose.yml port nginx 80)
+echo "$NGINX_ADDR"   # e.g. 127.0.0.1:19234 — the REAL address, whatever NGINX_HTTP_PORT actually resolved to
+
+curl "http://${NGINX_ADDR}/nginx-health"   # -> 200, body "ok"  (proxy liveness only)
+curl "http://${NGINX_ADDR}/api/health"     # -> 200, {"status":"ok","message":"...","service":"api"}
+curl "http://${NGINX_ADDR}/api/ready"      # -> 200, {"status":"ok","service":"api","checks":{"network":"ok","cors":"ok"}}
+```
+
+**PowerShell:**
+
+```powershell
+$NginxAddr = docker compose -p relis -f docker-compose.yml port nginx 80
+Write-Host $NginxAddr   # e.g. 127.0.0.1:19234
+
+Invoke-WebRequest "http://$NginxAddr/nginx-health" -UseBasicParsing
+Invoke-WebRequest "http://$NginxAddr/api/health" -UseBasicParsing
+Invoke-WebRequest "http://$NginxAddr/api/ready" -UseBasicParsing
+```
+
+Both forms were run against a real, disposable, guarded project with a
+deliberately non-default `NGINX_HTTP_PORT` (`19234`, chosen far from the
+default specifically to rule out a coincidental match) during this
+sub-issue's own verification pass: `docker compose port nginx 80` printed
+`127.0.0.1:19234`, and every probe against that discovered address
+returned `200` in both Bash and PowerShell. Open the same discovered
+address in a browser (`http://<discovered-address>/`) for the application
+itself.
 
 ## Shutdown and reset
 
@@ -133,6 +296,25 @@ how to recreate the stack afterward.
   existing `API_CORS_ORIGIN` setting (still configured, defensively, as
   `http://localhost:${NGINX_HTTP_PORT}`) is not actually exercised in
   normal use.
+
+## Local access quick reference
+
+Implements local sub-issue [02.05](../../../context/notion-tasks/sub-issues/02-05.md).
+Every row's "Purpose" and "Limitation" is traceable to a specific section
+below (or to "Known limitations") — this table is a map, not a
+replacement for reading those sections before relying on any of this for
+more than a quick lookup.
+
+| URL / address | Host-facing or internal-only? | Purpose | Limitation |
+| --- | --- | --- | --- |
+| `http://localhost:${NGINX_HTTP_PORT:-8080}/` | Host-facing, loopback only | The application itself (served by `web`, via nginx). | None beyond normal app behavior — not this sub-issue's concern. |
+| `http://localhost:${NGINX_HTTP_PORT:-8080}/nginx-health` | Host-facing, loopback only | **Proxy liveness only.** | Does **not** mean `web`/`api` are reachable or ready — see "Health and readiness" below. |
+| `http://localhost:${NGINX_HTTP_PORT:-8080}/api/health` | Host-facing, loopback only | `apps/api`'s liveness route, through the proxy. | Not a dependency check of any kind — see "Health and readiness" below. |
+| `http://localhost:${NGINX_HTTP_PORT:-8080}/api/ready` | Host-facing, loopback only | `apps/api`'s readiness route, through the proxy. | Reports **network/CORS initialization only** — never database or queue readiness, because `apps/api` has neither integrated. See "Health and readiness" below. |
+| `http://127.0.0.1:${MAILHOG_UI_PORT:-8025}/` | Host-facing, loopback only | MailHog's real mail-capture UI (verified identity, not an arbitrary `200` — see "Mail capture" below). | Development-only tooling, not a product feature. No application mail adapter exists to send anything to it yet — see "Mail capture" below. |
+| `http://127.0.0.1:${SEAWEEDFS_S3_PORT:-8333}/` | Host-facing, loopback only | SeaweedFS's S3-compatible gateway (credentialed — `docker/storage/s3-identities.json`). | Development-only infrastructure. No application storage adapter exists yet. |
+| `api:3001`, `web:3000`, `postgres:5432`, `mailhog:1025` (SMTP), `storage:9333`/`8888` (SeaweedFS master/filer) | **Internal only** — Compose network hostnames | Container-to-container addressing. | Never reachable from the host browser/shell at all; reaching them requires `docker compose exec` into a container already on the `relis` network. See "Host port exposure policy" above for why this is deliberate, and its own explicit statement that Docker's internal network is not a security boundary against the host administrator. |
+| *(no URL — none exists)* | n/a | Job/queue observability. | **No such endpoint exists anywhere in this stack.** See "Job observability" below — do not go looking for one. |
 
 ## Health and readiness — verified URLs and their actual meaning
 
@@ -206,6 +388,122 @@ building on the service graph above.
   reach any internal service regardless of whether it publishes a host
   port. The loopback-only publish rule above is the actual, and only,
   host-facing boundary this sub-issue establishes and verifies.
+
+## Mail capture
+
+Implements local sub-issue [02.05](../../../context/notion-tasks/sub-issues/02-05.md).
+MailHog is prescribed by `context/project-structure.md`'s required
+`docker/mailhog/` entry — it is this stack's mail-capture tool, not an
+open MailHog-vs.-Mailpit choice still to be made (the parent task's own
+language mentions "MailHog/Mailpit" generically, but the structure
+document already settled it, and `docker-compose.yml` already runs
+`mailhog/mailhog:v1.0.1`).
+
+- **URL:** `http://127.0.0.1:${MAILHOG_UI_PORT:-8025}/` (loopback-only —
+  see "Host port exposure policy" above).
+- **Verified to actually be MailHog's own interface, not merely an
+  arbitrary `200`.** `stack-smoke.test.ts` checks two signals specific to
+  the real `mailhog/mailhog:v1.0.1` image (confirmed by direct inspection
+  of a live container during this task), not a generic status code:
+  - The root page's `<title>MailHog</title>` and `ng-app="mailhogApp"` —
+    markup unique to MailHog's own Angular UI shell.
+  - `GET /api/v2/messages` returns MailHog's own distinctive JSON shape
+    (`{"total":0,"count":0,"start":0,"items":[]}` against a fresh
+    instance) — MailHog's real message-listing API, not a page that
+    merely looks like a mail client.
+- **Distinguish "MailHog is running and reachable" from "the application
+  sends mail through it" — the second does NOT exist.** Searching
+  `apps/api`/`apps/web`/`apps/worker` finds no mail-sending code, no SMTP
+  client dependency, and no `mail/` module anywhere in this checkout (the
+  structure document reserves such a module's location, but it has not
+  been created) — there is no application-level mail adapter to verify,
+  and none is implemented by this sub-issue. The empty `items: []` above
+  is therefore the **correct**, expected state: nothing has ever been
+  sent to it, by this stack or by the application.
+- **Why this task does not go further and send a real test email through
+  SMTP:** MailHog's SMTP port (`mailhog:1025`) is deliberately
+  **internal-only** (see "Host port exposure policy" above) — reaching it
+  would require executing a raw SMTP conversation from inside another
+  container on the `relis` network (e.g. via `docker compose exec`),
+  which was judged disproportionate complexity/risk for marginal
+  additional evidence beyond the two MailHog-specific signals above, and
+  is explicitly out of this sub-issue's scope ("Do not implement email
+  delivery"). The two checks above already distinguish MailHog's real
+  identity/API from an arbitrary `200` without touching SMTP at all.
+- **Development-only tooling, not a product feature.** MailHog exists so
+  a developer can *manually* inspect what an application would have sent,
+  once a mail adapter exists — it ships with this stack regardless of
+  whether anything is using it yet (see
+  `docs/architecture/local-stack-inventory.md` §9 for the same
+  distinction, drawn independently during the preceding sub-issue).
+
+## Job observability
+
+Implements local sub-issue [02.05](../../../context/notion-tasks/sub-issues/02-05.md).
+**No job-observability endpoint of any kind exists in this stack** —
+there is no dashboard, no HTTP status page, and no API to query job
+state. This was verified by inspection, not assumed:
+
+- `apps/worker/src/main.ts` (reproduced in full below) opens **no network
+  listener at all**, in either `dev` or `start` mode — it loads and
+  validates configuration, logs one line, and returns:
+
+  ```ts
+  function main(): void {
+    loadEnvFiles(resolveRuntimeMode(process.env.NODE_ENV));
+    loadValidatedConfig();
+    console.log("ReLiS worker started");
+  }
+  ```
+
+- `docker-compose.yml` assigns `worker` no internal port, no published
+  host port (independently confirmed by the real running-container check
+  in `port-exposure.test.ts`, sub-issue 02.04), and no `healthcheck:`
+  block — there is no address to query even if you wanted to.
+- No other service in this stack (`api`, `web`, `nginx`, `postgres`,
+  `storage`, `mailhog`) exposes anything job-related either; `apps/api`'s
+  `/ready` explicitly reports only `network`/`cors`, never a queue check
+  (see "Health and readiness" above).
+
+**The only observability actually available is process-level, via
+Docker itself — not application-level:**
+
+```bash
+docker compose -p relis -f docker-compose.yml ps worker      # container lifecycle status (no health column — see "What a successful startup actually looks like")
+docker compose -p relis -f docker-compose.yml logs worker    # expect exactly one line: "ReLiS worker started"
+docker inspect <worker-container-id> --format '{{.State.Status}}'   # "running" in dev mode (tsx watch's supervisor)
+```
+
+**This process-level liveness is explicitly NOT evidence that any job was
+consumed or completed — there is no job to consume.** `worker`'s `dev`
+command (`tsx watch`) keeps its OS process alive by virtue of being a
+*file-watching supervisor*, not because it is waiting on or processing
+work; `start` mode runs the identical application logic to completion and
+exits. Neither mode polls, subscribes to, or drains any queue, in either
+mode, today. Treat `ps`/`logs` output here the same way you'd treat
+"the lights are on" — informative about the process, silent about work.
+
+- **The background-job technology (`pg-boss` vs. `BullMQ`) remains
+  undecided**, per `context/stack.yml`'s `background_jobs.status:
+  undecided`, and this sub-issue does not select or implement one (out of
+  scope by the task's own instruction).
+- **`pg-boss@^12.26.3` is a declared dependency of `apps/worker`
+  (`apps/worker/package.json`) but is imported and used nowhere in
+  `apps/worker/src`** — confirmed by searching the source tree during
+  this task (zero matches outside `package.json` itself and generated
+  `dist/`/`node_modules/` output). A dependency's presence in
+  `package.json` is not evidence of an implemented queue integration; see
+  `docs/architecture/local-stack-inventory.md` §3.3/§8 for the identical
+  finding, reached independently during the preceding sub-issue.
+- **No dashboard URL is documented here because none exists to document.**
+  Reporting this absence honestly, rather than inventing a URL or
+  building a dashboard to make this section look complete, is this
+  sub-issue's explicit instruction.
+- **Development-only concern, not a product feature** — once a real
+  queue consumer and (optionally) a dashboard are authorized and
+  implemented in a future, separately-scoped task, this section should be
+  rewritten to describe them; until then, this honest "unavailable" is
+  the accurate state.
 
 ## Clean-checkout startup
 
@@ -558,6 +856,292 @@ endpoint through nginx.
   logic specifically (as opposed to Docker's own escalation to `SIGKILL`
   after its stop grace period) was not individually isolated or timed.
 
+## Diagnostics
+
+Implements local sub-issue [02.05](../../../context/notion-tasks/sub-issues/02-05.md).
+Actionable steps for the failure scenarios this sub-issue calls out,
+each with a real symptom (several captured from this document's own
+real verification pass — see the completion report) and a scoped fix.
+**None of these recommends restarting Docker Desktop, deleting
+resources, or a broad prune as a routine step** — if a scoped fix below
+doesn't resolve it, that is a blocker to report, not a reason to reach
+for `docker system prune`.
+
+### Scoped inspection commands (service status, logs, migration exit codes, health/readiness, published ports)
+
+Every command below is scoped to this ONE project (`-p relis`, or
+substitute your own `-p` if you started with a different one) and is
+read-only — none of them changes any state, so they're always safe to
+run first, before anything in the scenario-specific steps below.
+
+**Discover the published port BEFORE probing health/readiness — never
+assume `localhost:8080`.** The health/readiness probes below depend on
+knowing the real address first, which is exactly why the port-inspection
+step comes before them here (not after, as an earlier draft of this
+document had it): `${NGINX_HTTP_PORT:-8080}` typed directly into your own
+shell reads your shell's environment, never the root `.env` file that
+`docker compose` itself resolves it from (see "Compose interpolation vs.
+application environment loading" above) — if that variable isn't
+separately exported into your shell, the expression silently falls back
+to `8080`, which may not be published at all. **Verified by real
+execution** against a disposable, guarded project with a deliberately
+non-default `NGINX_HTTP_PORT` (`19234`): `docker compose port nginx 80`
+printed the real `127.0.0.1:19234`, while a naive, unexported
+`${NGINX_HTTP_PORT:-8080}` in a fresh shell still resolved to `8080` and
+failed to connect.
+
+**Bash:**
+
+```bash
+# Service status at a glance (STATUS column shows "(healthy)", "(health: starting)",
+# "Exited (0)" for a successful one-shot migration, or no health annotation at all
+# for worker/mailhog/migrate-* — see "What a successful startup actually looks like").
+docker compose -p relis -f docker-compose.yml ps        # running services only
+docker compose -p relis -f docker-compose.yml ps -a     # include exited ones (migrate-control/migrate-project)
+
+# Logs for one service (add -f to follow).
+docker compose -p relis -f docker-compose.yml logs <service>
+
+# A migration's real exit code — not "a database with the right name exists"
+# (docker/postgres/init/ creates both databases unconditionally regardless of
+# whether either migration container ever runs — see "Database isolation").
+docker inspect $(docker compose -p relis -f docker-compose.yml ps -a -q migrate-control) --format '{{.State.ExitCode}}'
+
+# What host port (if any) a service is ACTUALLY published on right now —
+# discover this FIRST, then use it below.
+NGINX_ADDR=$(docker compose -p relis -f docker-compose.yml port nginx 80)
+echo "$NGINX_ADDR"   # e.g. 127.0.0.1:19234 — the REAL address, whatever NGINX_HTTP_PORT actually resolved to
+
+# Health/readiness through the proxy, using the DISCOVERED address (see "Health and readiness" above for what each actually means).
+curl "http://${NGINX_ADDR}/nginx-health"
+curl "http://${NGINX_ADDR}/api/health"
+curl "http://${NGINX_ADDR}/api/ready"
+
+# The more complete picture (every declared container port, including ones NOT
+# published at all) — what port-exposure.test.ts itself asserts on:
+docker inspect <container-id> --format '{{json .HostConfig.PortBindings}}'
+```
+
+**PowerShell:**
+
+```powershell
+# Service status, logs, and migration exit code — identical commands, no shell-specific syntax.
+docker compose -p relis -f docker-compose.yml ps
+docker compose -p relis -f docker-compose.yml ps -a
+docker compose -p relis -f docker-compose.yml logs <service>
+docker inspect $(docker compose -p relis -f docker-compose.yml ps -a -q migrate-control) --format '{{.State.ExitCode}}'
+
+# Discover the real published address first, then use it.
+$NginxAddr = docker compose -p relis -f docker-compose.yml port nginx 80
+Write-Host $NginxAddr   # e.g. 127.0.0.1:19234
+
+Invoke-WebRequest "http://$NginxAddr/nginx-health" -UseBasicParsing
+Invoke-WebRequest "http://$NginxAddr/api/health" -UseBasicParsing
+Invoke-WebRequest "http://$NginxAddr/api/ready" -UseBasicParsing
+
+docker inspect <container-id> --format '{{json .HostConfig.PortBindings}}'
+```
+
+### Docker is unavailable
+
+**Symptom:** `docker compose up` (or any `docker` command) hangs or fails
+immediately with something like `error during connect` or `the docker
+daemon is not running`.
+
+```bash
+docker info --format "{{.ServerVersion}}"   # succeeds (prints a version) only if the daemon is actually reachable
+```
+
+If this fails: start Docker Desktop (or your Docker daemon) **yourself** —
+this is a manual step, never an automated one. Every integration test in
+`tests/integration/docker-compose/` detects this the same way
+(`isDockerAvailableSync`) and reports a **skip with an explicit blocker
+message**, never a silent pass — the same honesty applies here: report
+"Docker is unavailable," don't claim the stack was verified.
+
+### A host port is already occupied
+
+**Symptom** (real text captured during this sub-issue's own verification,
+starting a second project while the first still held the same port):
+
+```
+Error response from daemon: failed to set up container networking: driver
+failed programming external connectivity on endpoint ...: Bind for
+127.0.0.1:58634 failed: port is already allocated
+```
+
+**Fix:** either stop whatever already holds that port, or change the
+conflicting variable in your `.env` — `NGINX_HTTP_PORT`, `MAILHOG_UI_PORT`,
+or `SEAWEEDFS_S3_PORT` (see "Compose interpolation vs. application
+environment loading" above for why editing `.env` is the right lever
+here, specifically) — then `docker compose up -d` again. To see what's
+already bound before changing anything: `docker compose -p relis -f
+docker-compose.yml ps` (another one of YOUR Compose projects) — do not
+assume the conflicting port is `8080`; read it from `.env`, or discover
+whatever is ACTUALLY published right now with `docker compose -p relis -f
+docker-compose.yml port nginx 80` (see "Scoped inspection commands"
+above) — or your OS's own port-listing tool for a non-Docker process
+(substitute the real port number, e.g. `netstat -ano | findstr :<port>`
+on Windows PowerShell/cmd).
+
+### An image build fails
+
+**Symptom:** `docker compose up --build` exits non-zero during the `api`,
+`web`, or `worker` image build step (`pnpm install --frozen-lockfile` or
+the `@relis/config` build failing inside the Dockerfile).
+
+```bash
+docker compose -p relis -f docker-compose.yml build api     # rebuild just one service, full output
+docker compose -p relis -f docker-compose.yml build --no-cache api   # rule out a stale cached layer specifically
+```
+
+Common causes: no network access to the pnpm/npm registry from inside
+the build (registry/proxy/firewall issue on the host), or a genuinely
+broken `pnpm-lock.yaml` (should not happen on an unmodified checkout —
+`pnpm install --frozen-lockfile` fails loudly rather than silently
+resolving different versions if the lockfile and `package.json` disagree).
+
+### Compose configuration itself is rejected
+
+**Symptom** (real text captured during this sub-issue's own verification,
+deliberately passing a malformed `NGINX_HTTP_PORT`):
+
+```bash
+$ NGINX_HTTP_PORT=not-a-number docker compose -f docker-compose.yml config --quiet
+invalid hostPort: not-a-number
+```
+
+This fails **before** anything starts — `compose-config.test.ts` asserts
+the healthy case prints nothing on success; a non-empty message (as
+above) or a non-zero exit from `docker compose config --quiet` means the
+resolved configuration itself is invalid. Check whatever `.env` value you
+most recently changed first; this is a Compose-level failure, distinct
+from an application's own `CONFIG_INVALID` diagnostic (next).
+
+### A migration fails
+
+**Symptom:** `migrate-control` or `migrate-project` exits non-zero
+instead of `0`.
+
+```bash
+docker compose -p relis -f docker-compose.yml logs migrate-control
+docker inspect <container-id> --format '{{.State.ExitCode}}'
+```
+
+Two distinct causes this stack's own tests already distinguish — check
+which one your log output matches before assuming either:
+
+- **Missing/invalid configuration**, caught BEFORE Prisma ever runs — a
+  safe `CONFIG_INVALID` diagnostic naming only the affected variable
+  category, never a value (`config-validation.test.ts`'s exact scenario).
+  **Fix — inspect and correct the right SOURCE variables; see "Which
+  settings actually apply" immediately below before touching `.env` —
+  `CONTROL_DATABASE_URL`/`PROJECT_DATABASE_URL` themselves are NOT what
+  these two Compose services read `.env` for, and editing them there has
+  no effect on this failure.**
+- **A valid configuration, unreachable target** — Prisma's own real
+  error, e.g. `` Error: P1001: Can't reach database server at
+  `postgres:5432` `` (`dependency-unavailable.test.ts`'s exact scenario;
+  this does echo the host/port/database name, but never the username or
+  password — see "Known limitations"). Fix: confirm `postgres` itself is
+  healthy first (`docker compose ps postgres`) — if it isn't, diagnose
+  `postgres` itself before retrying the migration.
+
+#### Which settings actually apply, per target — Compose vs. native
+
+**Verified directly against `docker-compose.yml`'s own `migrate-control`/
+`migrate-project` service definitions.** Each one's `environment:` block
+sets `CONTROL_DATABASE_URL`/`PROJECT_DATABASE_URL` as a literal value
+**assembled by Compose interpolation from smaller `POSTGRES_*` pieces** —
+it does **not** read a `CONTROL_DATABASE_URL`/`PROJECT_DATABASE_URL` line
+from `.env` directly, even though `.env.example` happens to define lines
+with those exact same names (for a *different* purpose — see "Native
+migration," below). Shown here as a shape with the SOURCE variable names
+in place of any value, never a real connection string or credential:
+
+| Compose target | URL variable the migration CODE validates | Built by Compose interpolation from (root `.env`, read by `docker compose` itself only) | Host/port |
+| --- | --- | --- | --- |
+| `migrate-control` | `CONTROL_DATABASE_URL` | `postgresql://<POSTGRES_USER>:<POSTGRES_PASSWORD>@postgres:5432/<POSTGRES_DB>` | Fixed at `postgres:5432` — not independently configurable here. |
+| `migrate-project` | `PROJECT_DATABASE_URL` | `postgresql://<POSTGRES_USER>:<POSTGRES_PASSWORD>@postgres:5432/<PROJECT_TEST_DB_NAME>` | Same, fixed at `postgres:5432`. |
+
+**So, to fix a Compose migration's configuration:** inspect and correct
+`POSTGRES_USER`, `POSTGRES_PASSWORD`, and — depending on which target
+failed — `POSTGRES_DB` (`migrate-control`) or `PROJECT_TEST_DB_NAME`
+(`migrate-project`), all in the root `.env`. **Editing the
+`CONTROL_DATABASE_URL`/`PROJECT_DATABASE_URL` lines in that SAME `.env`
+file has no effect whatsoever on either Compose service** — neither one
+is wired to read them (see "Compose interpolation vs. application
+environment loading" above for the general version of this distinction).
+
+**Native migration execution reads the opposite set of variables.**
+Running the identical migration OUTSIDE Docker —
+`pnpm --filter @relis/database run migrate control` /
+`run migrate project`, from `relis/` — uses `@relis/config`'s own
+`loadEnvFiles` (documented in `README.md` "Environment loading and
+override precedence") to read `CONTROL_DATABASE_URL`/
+`PROJECT_DATABASE_URL` **directly, as a complete connection string**, from
+`.env`/`.env.local`/the real shell environment — it never assembles one
+from `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`/
+`PROJECT_TEST_DB_NAME` at all. These are genuinely two different
+mechanisms sharing one `.env` file for two different sets of variables;
+a value correct for one migration path (native) is not what the other
+path (Compose) consumes, and vice versa.
+
+**⚠️ Changing `POSTGRES_DB` or `PROJECT_TEST_DB_NAME` to "fix" a Compose
+migration does not retroactively apply to an already-existing
+`<project>_postgres-data` volume** — this is the SAME warning already
+stated in "Honest limitations of 'recreated'" above, repeated here
+because it is the single most common way this specific fix goes wrong:
+`docker/postgres/init/` only runs on a genuinely first init, so renaming
+either variable against a volume that already exists does not create a
+database under the new name — the migration will then fail differently
+(the target database itself does not exist), not because the new name is
+wrong. **This is not a reason to reset by default.** First confirm
+whether the database name you actually need already exists on the
+running server (read-only, no credential in the example — `$POSTGRES_USER`
+here is expanded BY THE CONTAINER's own shell via `sh -c`, where it is
+genuinely set from the same `environment:` block Compose already
+resolved; expanding it from your own host shell instead would silently
+read an unrelated or empty value, the identical class of mistake as the
+port-discovery issue above):
+
+```bash
+docker compose -p relis -f docker-compose.yml exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d postgres -tAc "SELECT datname FROM pg_database;"'
+```
+
+If it's genuinely missing and you intend to keep the existing volume's
+other data, create it manually (a non-destructive, explicit DDL
+statement — substitute the real target name, never paste a password into
+this command: `psql` picks up its own credentials from the container's
+already-configured environment, or prompts interactively):
+
+```bash
+docker compose -p relis -f docker-compose.yml exec -T postgres sh -c 'psql -U "$POSTGRES_USER" -d postgres -c "CREATE DATABASE <target-db-name>;"'
+```
+
+Only if you genuinely want a clean slate — never as the routine or
+default response to this specific failure — does the explicit, already
+project-scoped reset in ["Shutdown and reset"](#shutdown-and-reset) apply
+instead.
+
+### The API is unavailable through the proxy
+
+**Symptom:** `/api/health`/`/api/ready` through nginx return a `5xx`
+(observed: `504 Gateway Timeout`, not an instant `502` — see "Health and
+readiness" above for exactly why) instead of `200`.
+
+```bash
+docker compose -p relis -f docker-compose.yml ps api     # is it even running, and healthy?
+docker compose -p relis -f docker-compose.yml logs api   # why did it stop, or never start?
+docker compose -p relis -f docker-compose.yml restart api
+```
+
+This is specific to the `/api/` route — `/` (the web app) and
+`/nginx-health` keep working throughout (proxy liveness is independent of
+API readiness; see "Health and readiness" above), so check those two
+first to confirm the failure is actually scoped to `api` and not the
+whole proxy/stack.
+
 ## Tests
 
 `tests/integration/docker-compose/`:
@@ -590,7 +1174,11 @@ endpoint through nginx.
   - `apps/worker`'s container is actually `running` (the `tsx watch`
     supervisor's liveness) and its startup log line is present —
     explicitly not treated as evidence of job processing.
-  - MailHog's UI reachable; a real signed SeaweedFS S3 PUT + GET
+  - MailHog's root page and message-listing API are genuinely MailHog's
+    OWN interface (local sub-issue 02.05) — its distinctive
+    `<title>MailHog</title>`/`ng-app="mailhogApp"` markup and exact
+    `{total,count,start,items}` API shape, not merely an arbitrary `200`
+    (see "Mail capture" above); a real signed SeaweedFS S3 PUT + GET
     round-trip.
   - `NGINX_HTTP_PORT` is chosen as a REAL free port with `getFreePort()`
     **before** `docker compose up` runs — not the host-port-`0`
