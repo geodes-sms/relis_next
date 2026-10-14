@@ -401,6 +401,155 @@ resolved:
       directory exists yet in this checkout (confirmed alongside §3's
       migrations-directory check) and this document does not create it.
 
+## 10. Generated-client preparation workflow (added for 03.05's corrective pass)
+
+03.05 exposed a typed repository surface (`packages/database/src/repositories/`,
+`src/control-repositories.ts`) whose public entry point (`src/index.ts`)
+imports the **gitignored** generated Control client
+(`packages/database/generated/control-client/`), and `@relis/database`
+itself imports `@relis/config`, whose `exports` field resolves to the
+equally **gitignored** `packages/config/dist/`. A review pass found that
+on a genuinely clean checkout — before `prisma generate` and
+`@relis/config`'s `tsc` build have ever run — three things would fail for
+lack of those two directories: `tsc --noEmit` on `@relis/database` itself,
+the root `typecheck:tests` pass (which typechecks `tests/**/*.ts`,
+including files that import `@relis/database`), and **test collection**
+for any Vitest file that imports `@relis/database` at its top level
+(collection evaluates a file's imports before any `beforeAll` hook runs —
+a Docker-gated `beforeAll` that regenerates the client, as
+`repository-operations.test.ts`'s own `beforeAll` does inside its
+container, happens far too late to satisfy a HOST-side import at
+collection time). An earlier corrective pass fixed the generated-client
+half of this gap but missed the `@relis/config` build half in two of the
+three affected scripts.
+
+**Fix: every entry point that needs either dependency now prepares both,
+in the correct order, deterministically, before doing anything else —
+never relying on another script or test file having already run first:**
+
+| Command | What it now does |
+| --- | --- |
+| `pnpm --filter @relis/database run generate:control` | Regenerates the Control client alone (no config build, no typecheck, no test) — always safe to run standalone; `prisma generate` is idempotent and needs no database connection. |
+| `pnpm --filter @relis/database typecheck` | Now runs `pnpm --filter @relis/config build` first, then `generate:control`, then `tsc --noEmit` — self-sufficient on a clean checkout (previously ran `generate:control` only, leaving the `@relis/config` import unresolved). |
+| `pnpm run typecheck` (root) | `pnpm -r typecheck` (which includes the line above) runs before `typecheck:tests` — already covered transitively. |
+| `pnpm run typecheck:tests` (root) | Already built `@relis/config` first, then `@relis/database`'s `generate:control`, then typechecked — this one needed no change. |
+| `pnpm run test:integration` (root) | Now runs `pnpm --filter @relis/config build` first, then `@relis/database`'s `generate:control`, before `vitest run` ever begins collecting test files — self-sufficient even as the very first command run against a clean checkout (previously ran `generate:control` only, leaving the `@relis/config` import unresolved at collection time). |
+| `pnpm run test:migration` (root) | **Unchanged, deliberately** — no file under `tests/migration/` imports `@relis/database`'s source at all (they only shell out to Docker/`psql`), so this gap does not apply there. |
+
+Neither generated directory is ever committed (`.gitignore`:
+`packages/database/generated/` and `dist` respectively) and no step above
+writes anything to git-tracked source — only to those already-ignored
+output directories, exactly as `prisma generate` and `tsc` always have.
+No circular script dependency is introduced: `@relis/config`'s own
+`build` script does not and must not depend on `@relis/database`.
+
+### What was actually verified, and how
+
+**Mechanism:** *not* a `git worktree` (a worktree checks out a committed
+`HEAD`, which would have excluded this session's uncommitted edits — the
+actual fix under test). The verification instead copied the working tree
+(every tracked file plus this session's uncommitted changes, via `tar`,
+excluding `node_modules/`, `.git/`, `packages/config/dist/`,
+`packages/database/generated/`, and any `*.tsbuildinfo`) into a separate
+temporary directory outside the repository, then ran a fresh
+`pnpm install --frozen-lockfile` there. The primary working copy's
+`dist`/`generated` output was never deleted or modified to produce this
+evidence. Each of the three self-preparing commands was re-verified
+**independently**: `packages/config/dist/` and `packages/database/generated/`
+were deleted from the isolated copy again before each command, so no
+command's evidence relied on a previous command already having prepared
+its dependencies.
+
+- `pnpm --filter @relis/database typecheck`, run from a state with both
+  directories absent: **exit 0**; both directories existed afterward.
+- `pnpm run typecheck:tests`, re-run from a state with both directories
+  absent again: **exit 0**; both directories existed afterward.
+- `pnpm run test:integration` (the full documented command, unscoped), run
+  from a state with both directories absent again: **exit 1** — not
+  because preparation failed (both directories were created immediately,
+  before Vitest started, exactly as intended), but because the full suite
+  it runs includes tests unrelated to this sub-issue. Result: **3 failed,
+  355 passed, 16 skipped (374 total)**, across 2 failed test files:
+  - `tests/integration/control-prisma/*` (all three files: `repository-operations.test.ts`,
+    `error-sanitization.test.ts`, `schema-validation.test.ts`) — **all passed**,
+    confirming the generated-client/config-build preparation is sufficient
+    for this sub-issue's own evidence even under this failure.
+  - `tests/integration/runtime-config/web-build-output.test.ts` — one
+    Turbopack-build assertion failed: Next.js's workspace-root inference
+    reported it could not resolve `next/package.json` from
+    `<isolated-copy-path>\apps\web\src\app`.
+  - `tests/integration/runtime-config/migration.test.ts` — two assertions
+    failed: the real `migrate` subprocess reported `spawn ... ENOENT` for
+    `@prisma/engines`'s `schema-engine-windows.exe` instead of reaching the
+    expected `P1001` connection error.
+
+**Possible cause of the full-suite failures — not conclusively
+established.** The isolated copy's path is
+`C:\Users\guinb\AppData\Local\Temp\claude\...\scratchpad\clean-checkout-03.05b\relis\`
+— substantially deeper than the primary working copy's path. The failing
+`schema-engine-windows.exe` path measured **exactly 260 characters**,
+Windows' classical `MAX_PATH` threshold. That measurement supports a
+path-length *hypothesis* for the `migrate`/Prisma failure — it does not by
+itself establish that path length is the actual cause, and no equivalent
+length measurement was taken for the Turbopack workspace-root-inference
+failure, so the hypothesis is weaker, and separately unconfirmed, for that
+second failure.
+
+To gather further evidence (not to run a controlled, single-variable
+comparison), both affected files were re-run, with the identical current
+code, directly in the primary (shallow-path) working copy:
+- `tests/integration/runtime-config/web-build-output.test.ts` alone:
+  **5 passed, 0 failed.**
+- `tests/integration/runtime-config/migration.test.ts` alone: **10 passed,
+  0 failed** — including both tests that failed in the isolated copy.
+
+This shows the deep temporary copy's full-suite run failed in these two
+files while targeted reruns of the same files, with the same code, passed
+in the existing working copy. It does **not** show that only the
+filesystem path changed between the two environments: the isolated copy
+was also built from a fresh `pnpm install --frozen-lockfile
+--ignore-scripts` rather than the primary copy's existing, script-enabled
+install, and `packages/config/dist/` and `packages/database/generated/`
+were freshly rebuilt there rather than reused. Any of these installation-
+or build-state differences, not only path depth, could in principle
+contribute to the discrepancy, so this is not a controlled comparison and
+does not conclusively prove path length — or any other single factor — is
+the cause.
+
+**The exact cause of both full-suite failures is unconfirmed.** What the
+evidence above does establish: (a) the self-preparation fix worked
+correctly in all three independent checks — `packages/config/dist/` and
+`packages/database/generated/` were created before any dependent step ran,
+every time; (b) all three `control-prisma/*` test files passed in both the
+isolated copy and the primary working copy; (c) the two unrelated test
+files that failed only in the isolated copy passed in full, unmodified,
+when rerun in the primary working copy. None of this is evidence of a
+defect in `@relis/database`, its repositories, or the script changes
+documented above — but the path-length explanation for *why* the isolated
+copy's run failed remains a hypothesis, not a confirmed cause.
+
+### A tested way to run only the Control-DB tests
+
+`pnpm run test:integration -- tests/integration/control-prisma/` does
+**not** narrow execution — the root `test:integration` script is a
+`&&`-chained command, and pnpm appends forwarded arguments (including a
+literal `--`) to the end of that whole chain rather than specifically to
+`vitest`'s own argument list; the full 374-test suite still runs. The
+tested way to scope to just this sub-issue's tests is to run the
+preparation and the test runner as separate steps:
+
+```sh
+pnpm --filter @relis/config build
+pnpm --filter @relis/database run generate:control
+npx vitest run --config vitest.integration.config.ts tests/integration/control-prisma/
+```
+
+This was run directly (both in an isolated clean copy and in the primary
+working copy) and correctly scoped to exactly the three `control-prisma/*`
+files — **36 passed, 1 skipped (the Docker-unavailable branch, correctly
+skipped since Docker is available), 0 failed** — see 03.05's corrective-pass
+completion report for the full per-test listing.
+
 ## Acceptance-criteria evidence (for this sub-issue, 03.01)
 
 - **AC1 (resolve the actual database package exports and consumers):** §2

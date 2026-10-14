@@ -3,11 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "pnpm --filter @relis/config build && pnpm run generate:control && tsc --noEmit",
     "migrate": "tsx src/migrate.ts",
     "generate:control": "prisma generate --config prisma/control/prisma.config.ts",
-    "smoke:control": "tsx scripts/control-client-smoke.mts"
+    "smoke:control": "tsx scripts/control-client-smoke.mts",
+    "smoke:repositories": "tsx scripts/repository-smoke.mts"
   },
   "dependencies": {
     "@prisma/adapter-pg": "^7.9.0",
