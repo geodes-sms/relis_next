@@ -152,7 +152,7 @@ or **Unresolved**.
 | Project: unique short name | 18 — UI behavior/API behavior; 19 — UI behavior ("short name is read-only") | Uniqueness "enforced with a Control DB constraint, not only client-side" (18 — API behavior) | Control DB | Required, unique, immutable after creation | explicit |
 | Project: description | 18 — UI behavior; 19 — UI behavior (owner-editable) | — | Control DB | Optional | explicit |
 | Project: ordered research questions (+ optional description each) | 18 — UI behavior; 21 — Data model ("Research Questions and their display order") | Wizard step 1; direct-editing in Settings (21) | Control DB | Reorder via move-up/move-down only; backend manages the actual order value — no client-editable numeric order field (21 — UI/API behavior) | explicit |
-| Project: `createdByUserId` | 18 — API behavior; 19 — Users/permissions (`currentUserId === project.createdByUserId`) | Determines Project Owner and edit authority | Control DB | Immutable; never accepted from the client; backend enforces correspondence with the protected owner membership (18) | explicit |
+| Project: `createdByUserId` | 18 — API behavior; 19 — Users/permissions (`currentUserId === project.createdByUserId`) | Determines Project Owner and edit authority | Control DB | Immutable; never accepted from the client; backend enforces correspondence with the protected `PROJECT_OWNER` membership (18) — **decided**: 1:1 in the current scope, unsupported-for-transfer (not a permanent prohibition on a future, separately approved transfer feature); see [`control-database-role-decision.md`](control-database-role-decision.md) §3.3/§6 | explicit — ownership-transfer question resolved for the current scope |
 | Project: lifecycle state (`PROVISIONING` → ready/active) | 16 — Data model/API behavior; 18 — API behavior | Gates when the project and owner membership activate | Control DB | Activated only after Project DB ready **and** `v1` protocol persisted (18) | explicit |
 | Project: displayed status set (`Draft`, `Provisioning`, `Active`, `Published`, `Archived`) | 19 — UI behavior | `/projects` list filtering | Control DB | — | explicit display requirement; **important distinction, not a contradiction**: "Draft" here denotes a creation **draft** (§3.6), which is not a Project row at all — 19 merges drafts into the same visual list but the underlying entity differs; 03.04 must not collapse draft-existence and `Project.state` into one field |
 | Project: provisioning metadata — idempotency key, template release identifier, job reference, safe failure code/message | 16 — Data model | Idempotent provisioning request/retry | Control DB | Retrying must not duplicate the project/membership/database (16 — Acceptance criteria) | explicit |
@@ -167,12 +167,11 @@ or **Unresolved**.
 | Field / relation | Source (file — section) | Behavior requiring persistence | Ownership | Constraints | Status |
 | --- | --- | --- | --- | --- | --- |
 | Membership: `projectId`, `userId` | 15 — Data model | Authorization boundary for every project-scoped request (15 — API behavior) | Control DB | Exactly one active membership per `(projectId, userId)` | explicit |
-| Membership: role | 15 — Data model (`PROJECT_ADMIN`, `PROJECT_MANAGER`, `REVIEWER`, `VALIDATOR`, `GUEST`) | Role-based authorization everywhere project-scoped | Control DB | Exactly one project role per active membership (15 — Users/permissions) | **conflicting** — 18 — API behavior introduces a protected `PROJECT_OWNER` role/status not in 15's five-value enum; see decision gate §5.1, deferred to 03.03 |
-| Membership: status (`ACTIVE`, `REMOVED`) | 15 — Data model | Removal/restoration | Control DB | — | explicit |
-| Membership: `PENDING_PROVISIONING` status (owner only) | 18 — API behavior | Owner membership exists before the project is ready | Control DB | Activated only once Project DB ready + `v1` persisted | explicit, but its relationship to 15's two-value status enum (`ACTIVE`/`REMOVED`) is not reconciled by any source — part of decision gate §5.1 |
+| Membership: role | 15 — Data model (`PROJECT_ADMIN`, `PROJECT_MANAGER`, `REVIEWER`, `VALIDATOR`, `GUEST`) | Role-based authorization everywhere project-scoped | Control DB | Exactly one project role per active membership (15 — Users/permissions) | **decided** (formerly conflicting) — canonical enum is `PROJECT_OWNER, PROJECT_MANAGER, REVIEWER, VALIDATOR, GUEST`: 15's `PROJECT_ADMIN` is renamed to `PROJECT_OWNER`, not a sixth value added; see [`control-database-role-decision.md`](control-database-role-decision.md) §3.1/§4, which closes decision gate §5.1 |
+| Membership: status (`PENDING_PROVISIONING`, `ACTIVE`, `REMOVED`) | 15 — Data model (`ACTIVE`/`REMOVED`); 18 — API behavior (`PENDING_PROVISIONING`, owner-only, pre-activation) | Removal/restoration; owner membership exists before the project is ready | Control DB | Activated only once Project DB ready + `v1` persisted; the Owner row never reaches `REMOVED` through any membership endpoint (role-decision §6) | **decided** (formerly unreconciled) — three-value enum confirmed, `PENDING_PROVISIONING` applies only to the Owner's initial row; see [`control-database-role-decision.md`](control-database-role-decision.md) §6, closing the status-enum half of decision gate §5.1 |
 | Membership: actor, timestamps, removal reason | 15 — Data model | Audit trail for membership changes | Control DB | — | explicit |
-| Last-protected-member guard | 15 — Acceptance criteria ("Removing the last Project Admin is rejected") vs. 15 — API behavior ("does not violate the last-Project-Manager guard") | Prevents a project from losing its protected member | Control DB | — | **conflicting within the same guide** — 15 itself names both "last Project Admin" and "last Project Manager" as the protected target; see decision gate §5.2 |
-| Project Manager cannot remove Project Admin | 15 — Users/permissions | Role-change/removal authorization | Control DB (business rule, not a field) | — | explicit |
+| Last-protected-member guard | 15 — Acceptance criteria ("Removing the last Project Admin is rejected") vs. 15 — API behavior ("does not violate the last-Project-Manager guard") | Prevents a project from losing its protected member | Control DB | The Owner's protection is absolute and not count-based; there is **no** Manager-count floor (role-decision §3.2) | **decided** (formerly conflicting within the same guide) — both phrases are read as describing the Owner's now-unconditional protection; the "last-Project-Manager guard" phrase specifically is **rejected** as a real, independent rule; see [`control-database-role-decision.md`](control-database-role-decision.md) §3.2/§4, closing decision gate §5.2 |
+| Project Manager cannot remove Project Admin | 15 — Users/permissions | Role-change/removal authorization | Control DB (business rule, not a field) | — | **decided** — now a redundant restatement: *nobody* (not only Project Manager) can remove or role-change the `PROJECT_OWNER` membership, including Application Administrator (role-decision §3.3/§6) |
 | Historical attribution preserved on removal | 15 — Audit | Removing a membership "revokes access but never deletes the global account or historic project work" | Control DB / Project DB (cross-cutting, same note as §3.1) | — | explicit |
 | "Project DB contains no user identities, passwords, invitations, roles, or membership copies" | 15 — Data model | — | Explicit **negative** ownership statement | — | explicit — directly supports this sub-issue's "preserve domain boundaries" requirement: no membership duplication into the Project DB under any circumstance |
 
@@ -238,7 +237,7 @@ The open reconciliation: §3.8's own `AuditEvent` row states it is "append-only.
 | Identity | Core user, credentials, tokens, external identity | None — explicit negative (13) | Profile image bytes; JWT signing keys (secret config) | Account-status enum representation (§3.1) |
 | Session | Session/revocation record | None | JWT signing keys (secret config) | Revoke-all mechanism (§3.2) |
 | Project | Registry, metadata, lifecycle, provisioning state | None until ready; then project-runtime data only (19 — Data model) | Cover image bytes (inferred) | Project↔Project-DB connection mapping (§3.3, gap) |
-| Membership | All of it | **Explicit none** (15 — Data model) | — | Role enum (`PROJECT_OWNER` vs. `PROJECT_ADMIN`), §5.1 |
+| Membership | All of it | **Explicit none** (15 — Data model) | — | Role/status enums **resolved** (§5.1/§5.2 — see [`control-database-role-decision.md`](control-database-role-decision.md)); unaffected gaps remain in §5.4 (who may create a project, unrelated) |
 | Invitation | All of it | None | Email delivery via job platform | Expiry period value + storage location (§5.3, §3.5) |
 | Draft | All of it (JSONB) | None — explicit negative (18) | — | Post-conversion disposition (§3.6, gap) |
 | Job | Application metadata (generic case, 06/07) | None mentioned generically; **but** 39/40's export-specific audit event is Project DB (explicit for 40, inferred for 39) | pg-boss's own tables (co-located, not modeled here); result artifacts via storage (07, generic case only) | Queue engine itself remains undecided (PENDING-DECISIONS item 1) — not resolved here; **39/40 are an explicit, named exception with no job/storage footprint at all** — see §5.11, not resolved by assuming jobs are mandatory for every export |
@@ -254,8 +253,11 @@ precise question a decision must answer, and exactly what downstream schema
 work it blocks. None of these is resolved by this document; recording them
 does not authorize picking a side.
 
-**5.1 — `PROJECT_OWNER` vs. `PROJECT_ADMIN` (role model).** Conflicting
-sources: [15 — Data model/Users and permissions](../../../context/notion-tasks/15-membership.md)
+**5.1 — `PROJECT_OWNER` vs. `PROJECT_ADMIN` (role model). RESOLVED in
+[03.03](../../../context/notion-tasks/sub-issues/03-03.md) — see
+[`control-database-role-decision.md`](control-database-role-decision.md).**
+Conflicting sources (unchanged, preserved for traceability):
+[15 — Data model/Users and permissions](../../../context/notion-tasks/15-membership.md)
 (five-value role enum headed by `PROJECT_ADMIN`, membership statuses
 `ACTIVE`/`REMOVED` only) vs. [18 — Users and permissions/API behavior](../../../context/notion-tasks/18-protocol-wizard.md)
 (a protected `PROJECT_OWNER`, a `PENDING_PROVISIONING` status, and a
@@ -264,25 +266,27 @@ backend-enforced correspondence to `Project.createdByUserId`); also named in
 (`PROJECT_OWNER` as the only General-settings-authorized role) and
 [PENDING-DECISIONS item 2](../../../context/notion-tasks/PENDING-DECISIONS.md).
 Affected consumers: 15, 16, 18, 19, 21, 22 (audit role-mapping), 23.
-Precise question: is `PROJECT_OWNER` (a) an alias asserted over the existing
-`PROJECT_ADMIN` value, (b) a distinct, protected sixth role sitting above
-`PROJECT_ADMIN`, or (c) the sole protected creator role with `PROJECT_ADMIN`
-demoted to an ordinary assignable role? Blocks: the `Membership.role` enum,
-the membership-status enum (two vs. more values), and every "last protected
-member" guard — all of 03.04's schema work on this table. **Deferred
-entirely to [03.03](../../../context/notion-tasks/sub-issues/03-03.md)**, per
-this sub-issue's explicit instruction not to finalize role enums here.
+**Decision (user-approved):** `PROJECT_OWNER` replaces `PROJECT_ADMIN` as
+the sole protected creator role — not an alias layered on top of it, and
+not a sixth value added above it. See the decision record's §3.1/§4 for the
+full textual evidence (15's own prose already uses "Project Owner" and
+"Project Admin" interchangeably) and rejected alternatives. This closes the
+`Membership.role` enum question and the membership-status enum question
+(three values: `PENDING_PROVISIONING`, `ACTIVE`, `REMOVED`) for 03.04.
 
-**5.2 — Last Project Manager vs. last Project Admin guard.** Conflicting
-sources: both **within guide 15 itself** — Acceptance criteria ("Removing
-the last Project Admin is rejected") vs. API behavior ("does not violate the
+**5.2 — Last Project Manager vs. last Project Admin guard. RESOLVED in
+[03.03](../../../context/notion-tasks/sub-issues/03-03.md) — see
+[`control-database-role-decision.md`](control-database-role-decision.md)
+§3.2.** Conflicting sources (unchanged, preserved for traceability): both
+**within guide 15 itself** — Acceptance criteria ("Removing the last
+Project Admin is rejected") vs. API behavior ("does not violate the
 last-Project-Manager guard"); also [PENDING-DECISIONS item 2](../../../context/notion-tasks/PENDING-DECISIONS.md).
-Affected consumers: 15 only (but the guard logic is foundational to
-membership removal/role-change validation). Precise question: which
-role(s) — Manager, Admin, Owner, or more than one independently — trigger a
-"cannot remove the last one" rejection? Blocks: membership removal/role-change
-validation logic in 03.04; overlaps with 5.1 since the answer likely depends
-on how `PROJECT_OWNER` is finally modeled.
+Affected consumers: 15 only. **Decision (user-approved):** the Owner's
+protection is absolute and not count-based (no "last member" check is
+needed for the Owner — it simply can never be removed); there is **no**
+Manager-count floor — removing the last Project Manager is explicitly
+allowed. The "last-Project-Manager guard" phrase in 15's API behavior is
+rejected as a real, independent rule going forward.
 
 **5.3 — Invitation expiry: 7 days vs. 48 hours.** Conflicting sources: 15 —
 UI/API behavior (7-day default, admin-configurable) vs. 15 — Jobs behavior
@@ -303,17 +307,25 @@ names explicitly? Blocks: whether `Draft` creation needs an authorization
 check against a field that does not yet exist anywhere in this inventory (a
 "can-create-projects" flag/role has no source-named representation).
 
-**5.5 — Project ownership/administration access matrix.** Conflicting
-sources: 19 — Gaps (creator-plus-Application-Administrator access alternates
-with owner-only editing) and 21 — Gaps (Owner-only per Users/permissions vs.
-Project-Manager-inclusive per UI behavior's "Access rules"); [PENDING-DECISIONS
-items 6 and 11](../../../context/notion-tasks/PENDING-DECISIONS.md). Affected
-consumers: 19, 21. Precise question: the exact per-action/per-tab
-authorization matrix for Owner/Manager/Admin. Blocks: mostly an
-authorization-layer decision, not a schema field — but it determines whether
-any "settings access grant" needs its own schema representation at all
-(current reading: no — authorization is role-derived, not a separate grant
-table — but this is itself only an inference pending the decision).
+**5.5 — Project ownership/administration access matrix. RESOLVED in
+[03.03](../../../context/notion-tasks/sub-issues/03-03.md) — see
+[`control-database-role-decision.md`](control-database-role-decision.md)
+§3.4/§5.** Conflicting sources (unchanged, preserved for traceability): 19 —
+Gaps (creator-plus-Application-Administrator access alternates with
+owner-only editing — resolved by noting the creator *is* the Owner, so these
+were never actually different grantees) and 21 — Gaps (Owner-only per
+Users/permissions vs. Project-Manager-inclusive per UI behavior's "Access
+rules"); [PENDING-DECISIONS items 6 and 11](../../../context/notion-tasks/PENDING-DECISIONS.md)
+(item 6 remains open for the unrelated "who may create a project" question —
+see §5.4 above; only item 11's settings-access half is closed here).
+Affected consumers: 19, 21. **Decision (user-approved):** `PROJECT_OWNER`
+and Application Administrator only, for every action named in 19 (project
+metadata edit, publish/unpublish, archive/restore) and every Settings tab in
+21 (General, Screening, QA, Data Extraction, Reporting) — Project Manager
+has none of this access, in any tab. This explicitly overrides 21's own
+looser UI-behavior "Access rules" paragraph; see the decision record's §5
+for the full permission matrix. Authorization remains a pure API-boundary
+role check — no "settings access grant" schema element is introduced.
 
 **5.6 — Direct settings vs. a protocol-revision/activation job (guide 21's
 own self-contradiction).** Conflicting sources, all within 21: Description/
@@ -420,9 +432,13 @@ document does not invent a retention period, an exemption, or an approved
 policy for either side** — implementing 41 remains out of scope regardless
 of how this question is eventually answered.
 
-Documenting these twelve items does not block the rest of this inventory —
-every other field in §3 that is not cited above is unaffected and can
-proceed to 03.04 design once 03.03's role decision lands.
+Of these twelve items, **§5.1, §5.2, and §5.5 are now RESOLVED** per
+[03.03's decision record](control-database-role-decision.md); the remaining
+nine (§5.3, §5.4, §5.6–§5.12) are still open. Documenting all twelve does
+not block the rest of this inventory — every other field in §3 that is not
+cited above is unaffected and could already proceed to 03.04 design before
+03.03 landed, and the three now-resolved gates no longer block anything in
+03.04.
 
 ## 6. Planned verification scenarios (NOT executed — proposals for 03.04/03.05)
 
@@ -443,22 +459,20 @@ and tests the eventual schema/repositories.
 - **Project:** project short-name uniqueness enforced at the data layer
   (not only client-side); repeating the same provisioning idempotency key
   does not create a second project/database/membership; mutating project
-  metadata (title, description, research questions) is rejected for every
-  caller outside whichever Owner/Manager/Application-Administrator matrix
-  §5.4/§5.5 ultimately settles — per 19 alone, both the Project Owner *and*
-  an Application Administrator are explicitly authorized to edit (19 —
-  Users/permissions: "Only the project creator and Application
-  Administrators can access... Edit project"), so this scenario must **not**
-  assume every non-owner is forbidden; whether a Project Manager also gains
-  access to the overlapping Research-Questions field (as 21's UI behavior
-  claims, in tension with 21's own Owner-only Users/permissions statement)
-  is the still-open question in §5.5; an archived project rejects writes at
+  metadata (title, description, research questions) succeeds only for
+  `PROJECT_OWNER` and Application Administrator and is rejected for every
+  other role, including Project Manager — per the resolved decision in
+  [`control-database-role-decision.md`](control-database-role-decision.md)
+  §3.4/§5 (closing former gate §5.5); an archived project rejects writes at
   the API layer.
 - **Membership:** at most one active membership per `(projectId, userId)`
-  enforced at the data layer; removing the last protected member (per
-  whichever role 03.03 settles on) is rejected; a Project Manager cannot
-  remove a Project Admin/Owner; removing a membership never deletes the
-  underlying User row.
+  enforced at the data layer; removing or role-changing the `PROJECT_OWNER`
+  membership is rejected unconditionally — by the Owner themself, by a
+  Project Manager, or by an Application Administrator — with no "last
+  member" counting involved (role-decision §3.2/§9); removing the **last
+  Project Manager** in a project **succeeds** (the rejected "require at
+  least one Manager" alternative must not be silently implemented anyway);
+  removing a membership never deletes the underlying User row.
 - **Invitation:** at most one active invitation per `(projectId,
   normalizedEmail)` enforced at the data layer; resending invalidates the
   prior token; an expired invitation cannot be accepted; accepting requires
@@ -489,11 +503,29 @@ and tests the eventual schema/repositories.
 
 ## 7. Handoff checklist for 03.03, 03.04, and 03.05
 
-- [ ] **03.03** must resolve §5.1 (`PROJECT_OWNER`/`PROJECT_ADMIN`) and, as
-      part of the same decision, should address §5.2 (which role(s) the
-      "last protected member" guard protects) since both hinge on the same
-      role model. Do not finalize the `Membership.role` or
-      `Membership.status` enum before this lands.
+- [x] **03.03's four scoped decisions are approved.** §5.1
+      (`PROJECT_OWNER`/`PROJECT_ADMIN`), §5.2 (last-protected-member guard),
+      the settings/metadata half of §5.5, and the ownership-transfer
+      question are resolved and user-approved in
+      [`control-database-role-decision.md`](control-database-role-decision.md).
+      03.04 can now finalize the `Membership.role` enum
+      (`PROJECT_OWNER, PROJECT_MANAGER, REVIEWER, VALIDATOR, GUEST`) and
+      `Membership.status` enum (`PENDING_PROVISIONING, ACTIVE, REMOVED`)
+      against that record rather than guessing. §5.4 (who may create a
+      project) remains open and is **not** addressed by 03.03 — it is a
+      separate question about draft/project creation, not role
+      representation.
+- [x] **Owner-account archival gap (role-decision §3.5) — carried forward,
+      not blocking 03.03.** Correcting 03.03's decision record surfaced an
+      unresolved interaction: membership protection does not guarantee the
+      Owner's underlying `User` account stays active/authenticatable, and
+      no source states what should happen if it is archived. This is
+      **not** one of 03.03's four approved decisions and remains
+      explicitly **unresolved**, not approved — the user confirmed it
+      should be carried forward as a reported open gap rather than
+      resolved before 03.03 closes (see role-decision.md §3.5/§8). It
+      blocks only 13's future `archive-user` authorization design, not
+      this sub-issue's completion.
 - [ ] **03.04** (schema/migrations/client) should treat §3's **explicit**
       rows as the primary input, **inference** rows as needing an explicit
       note in the schema/PR description (not silent adoption), and must
@@ -550,11 +582,16 @@ and tests the eventual schema/repositories.
   enum, §3.3's connection-mapping gap, §3.6's draft-disposition gap, §3.8's
   correlation-mechanism gap, §3.7's export-audit ownership inference).
 - **Undefined role and ownership semantics are flagged before constraints
-  are proposed:** §5.1/§5.2 record the `PROJECT_OWNER`/`PROJECT_ADMIN` and
-  last-protected-member conflicts without proposing a resolution, and §3.4's
-  role-enum row is explicitly marked "conflicting" rather than defaulting to
-  either source's version; §6's project-metadata scenario is likewise made
-  conditional on §5.4/§5.5 rather than assuming a settled matrix.
+  are proposed:** as originally written for 03.02, §5.1/§5.2 recorded the
+  `PROJECT_OWNER`/`PROJECT_ADMIN` and last-protected-member conflicts without
+  proposing a resolution, and §3.4's role-enum row was marked "conflicting"
+  rather than defaulting to either source's version — satisfying this
+  sub-issue's own AC at the time. **Update:** 03.03 has since resolved §5.1,
+  §5.2, and the settings/metadata half of §5.5 with explicit user approval
+  (see [`control-database-role-decision.md`](control-database-role-decision.md));
+  §3.3/§3.4 and §6 above have been updated accordingly, and this remains
+  consistent with "flag before proposing constraints," since the flag came
+  first and the resolution was obtained, not assumed.
 - **No business schema or repository implementation is introduced:** this
   document contains no Prisma syntax, no TypeScript interface, and no code
   change; §2 confirms `@relis/contracts` and `@relis/database` are unchanged
