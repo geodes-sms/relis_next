@@ -1,8 +1,568 @@
-// Control-plane database schema. No models are defined yet: no
-// control-plane domain has been authorized for implementation. This
-// schema exists only so the Prisma CLI has a valid target for the
-// migration entry point (packages/database/src/migrate.ts) to validate
-// configuration against and invoke `prisma migrate deploy` on.
+// Control-plane database schema — sub-issue 03.04 ("Implement versioned
+// Control schema, migrations and generated client"). Every model below is
+// traced to a consuming requirement in
+// docs/architecture/control-database-contracts.md (see its schema-readiness
+// data dictionary) and to the approved role decision in
+// docs/architecture/control-database-role-decision.md. Fields/relationships
+// not explicitly required by a source are not invented here — see that
+// data dictionary for which choices are "explicit", "user-approved", or an
+// "engineering proposal" (the latter clearly labeled in this file's own
+// comments too).
+//
+// Boundaries preserved (see the data dictionary's ownership column for the
+// full per-field trace):
+// - No project-runtime protocol/papers/screening/QA/extraction tables here
+//   — those belong to the separate Project DB schema (prisma/project/),
+//   untouched by this sub-issue.
+// - No foreign keys into any individual Project DB — every cross-database
+//   reference below is a plain opaque identifier (e.g. Project.id used to
+//   derive the Project DB name, per guide 16 — never a Prisma relation).
+// - No pg-boss/queue-engine private tables are modeled here, and no
+//   pg-boss/BullMQ choice is made by this file — `JobRecord` is only the
+//   application-level job metadata layer guide 06 describes, co-located in
+//   this same physical database but not the queue engine's own storage.
+// - No forced job/retention for the direct-streaming CSV/BibTeX/Python/R
+//   exports (guides 39/40) — `JobRecord` exists for job-backed features
+//   only; those two export features never create a row here.
+//
+// Known Prisma-declarative limitations (see also
+// docs/architecture/control-database-role-decision.md §7's "category B"):
+// Prisma's schema language has no syntax for a CONDITIONAL (partial)
+// unique index or a CHECK constraint. Three invariants below are therefore
+// NOT expressed as `@@unique`/`@@check` here and are instead added as raw
+// SQL in this sub-issue's migration file, with the model comments below
+// pointing to exactly which ones:
+//   1. "At most one ACTIVE membership per (projectId, userId)" (not a
+//      plain `@@unique`, which would also block ever re-adding a
+//      previously REMOVED member).
+//   2. "At most one PROJECT_OWNER membership per project" (a partial
+//      unique index on projectId alone, filtered by role).
+//   3. "At most one INVITED invitation per (projectId, normalizedEmail)"
+//      (same conditional-uniqueness reasoning as #1).
+//   4. A CHECK constraint that `Invitation.proposedRole` can never be
+//      `PROJECT_OWNER` (role-decision.md §5 — Owner is never an
+//      invitation-assignable role).
+// `prisma migrate diff`/`db pull` do not understand these raw additions;
+// anyone regenerating a migration from the declarative schema alone must
+// re-add them. This is a known, accepted limitation of the current Prisma
+// version, not an oversight — see this sub-issue's completion report for
+// the exact migration-authoring process used.
 datasource db {
   provider = "postgresql"
+}
+
+generator client {
+  provider = "prisma-client-js"
+  // Distinct, explicit output — never the default `node_modules/.prisma`
+  // location, and never the same directory as the Project schema's future
+  // client (prisma/project/ has no generator yet — Project DB business
+  // models remain out of this sub-issue's scope). Generating here keeps
+  // the Control and Project clients structurally incapable of being
+  // conflated even once the Project schema gains its own generator later.
+  output = "../../generated/control-client"
+}
+
+// ---------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------
+
+/// Account-level lifecycle state (13 — Data model: "active/archive state";
+/// distinct from email-verification state, which is `User.emailVerifiedAt`
+/// below — 15 — Data model lists these as two separate properties).
+/// Engineering proposal: the exact 3-value shape is not spelled out by any
+/// source; "unverified" is modeled as `emailVerifiedAt IS NULL`, not a
+/// 4th status value, since 15 treats verification and account status as
+/// independent properties.
+enum AccountStatus {
+  ACTIVE
+  DISABLED
+  ARCHIVED
+}
+
+/// Canonical project role enum — user-approved in
+/// docs/architecture/control-database-role-decision.md §3.1/§4.
+/// `PROJECT_OWNER` replaces guide 15's `PROJECT_ADMIN`; it is not an
+/// additional sixth value.
+enum ProjectRole {
+  PROJECT_OWNER
+  PROJECT_MANAGER
+  REVIEWER
+  VALIDATOR
+  GUEST
+}
+
+/// Membership lifecycle status. `PENDING_PROVISIONING` applies only to the
+/// creator's PROJECT_OWNER row, per guide 18 — API behavior and
+/// role-decision.md §6. Every other membership is created directly
+/// `ACTIVE` (15 — API behavior).
+enum MembershipStatus {
+  PENDING_PROVISIONING
+  ACTIVE
+  REMOVED
+}
+
+/// Project provisioning lifecycle (16 — Data model/API behavior; 18 — API
+/// behavior). Deliberately independent of `Project.archivedAt`/
+/// `publishedAt` below — contracts.md §3.3 records the exact relationship
+/// between this state machine and the publication/archive dimensions as
+/// unspecified by any source; this schema does not invent one.
+enum ProjectProvisioningState {
+  PROVISIONING
+  READY
+  FAILED
+}
+
+/// Invitation lifecycle (15 — Data model, explicit).
+enum InvitationStatus {
+  INVITED
+  ACCEPTED
+  EXPIRED
+  CANCELLED
+}
+
+/// Application-level job status (06 — UI behavior: "queued/running/
+/// completed/failed/cancelled state").
+enum JobStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+// ---------------------------------------------------------------------
+// Identity (15 — Data model "Global User identity"; 09/10/11/12/13/14)
+// ---------------------------------------------------------------------
+
+model User {
+  id       String  @id @default(uuid())
+  /// Unique, normalized (15 — Data model). Normalization itself is an
+  /// application-layer concern (03.05); this column stores the already-
+  /// normalized value.
+  username String  @unique
+  /// Unique, normalized (15 — Data model; 10/11/12/14 all key off it).
+  email    String  @unique
+  /// Null = unverified. Non-null = the verification timestamp (15 — Data
+  /// model "email-verification state"; 10 — Behavior).
+  emailVerifiedAt DateTime?
+  status   AccountStatus @default(ACTIVE)
+
+  /// Application-wide authority (13 — Data model "global roles"),
+  /// deliberately a separate boolean, never the `ProjectRole` enum above —
+  /// role-decision.md §3's "Application Administrator is a separate global
+  /// authority" is preserved by construction: there is no schema path that
+  /// could confuse the two.
+  isApplicationAdministrator Boolean @default(false)
+
+  // --- Credentials (09 — Data model) ---
+  /// Nullable: a user created only via Google OIDC (14) may have no local
+  /// password at all until they set one.
+  passwordHash          String?
+  passwordSalt          String?
+  passwordParamsVersion Int?
+  lastLoginAt           DateTime?
+
+  // --- Session revocation (09 — Data model "revocation/token version";
+  // contracts.md §3.2 inference: a per-user counter lets "revoke every
+  // session" (11 — API behavior) happen without a fan-out UPDATE across
+  // every Session row — bumping this invalidates every JWT whose embedded
+  // tokenVersion claim no longer matches.) ---
+  sessionTokenVersion Int @default(0)
+
+  // --- Profile (12 — Data model: only the fields that guide actually
+  // names; no speculative display-name/bio fields are added) ---
+  preferredLocale        String?
+  profileImageStorageKey String?
+
+  // --- Pending email change (12 — API behavior: start-email-change /
+  // confirm-email-change). Modeled inline rather than a separate table:
+  // at most one pending change makes sense at a time (engineering
+  // proposal; token shape follows the same digest+expiry pattern as
+  // EmailVerificationToken/PasswordResetToken by analogy — not
+  // independently specified by 12 itself). ---
+  pendingEmail          String?
+  pendingEmailTokenHash String?
+  pendingEmailExpiresAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  emailVerificationTokens EmailVerificationToken[]
+  passwordResetTokens     PasswordResetToken[]       @relation("PasswordResetTokenUser")
+  passwordResetsRequested PasswordResetToken[]       @relation("PasswordResetRequestedByAdmin")
+  externalIdentities      ExternalIdentity[]
+  sessions                Session[]
+  createdProjects         Project[]                  @relation("ProjectCreator")
+  memberships             Membership[]               @relation("MembershipUser")
+  membershipsAdded        Membership[]               @relation("MembershipAddedBy")
+  membershipsRemoved      Membership[]                @relation("MembershipRemovedBy")
+  invitationsSent         Invitation[]               @relation("InvitationInviter")
+  invitationsAccepted     Invitation[]               @relation("InvitationAcceptedBy")
+  creationDrafts          ProjectCreationDraft[]      @relation("DraftOwner")
+  jobRecords              JobRecord[]                @relation("JobRecordActor")
+  auditEvents             AuditEvent[]               @relation("AuditEventActor")
+
+  @@map("users")
+}
+
+/// Single-use, expiring email-verification token (10 — Data model).
+/// Issuing a new token for the same user is an application-layer workflow
+/// (invalidate/replace the prior row) — not a DB constraint, since a user
+/// legitimately has zero-or-more HISTORICAL tokens over time; only one
+/// should ever be *unconsumed* at once, which this schema does not enforce
+/// with a partial index (lower-stakes than the Membership/Invitation
+/// invariants above — an engineering judgment call, not a source
+/// requirement either way).
+model EmailVerificationToken {
+  id          String    @id @default(uuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Digest only — never plaintext (10 — API behavior, explicit).
+  tokenHash   String    @unique
+  expiresAt   DateTime
+  consumedAt  DateTime?
+  /// Resend/retry count (10 — Data model "retry metadata"); exact shape
+  /// beyond a count is unspecified — engineering proposal.
+  retryCount  Int       @default(0)
+  createdAt   DateTime  @default(now())
+
+  @@map("email_verification_tokens")
+}
+
+/// Single-use, expiring password-reset token (11 — Data model).
+model PasswordResetToken {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation("PasswordResetTokenUser", fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String    @unique
+  expiresAt  DateTime
+  consumedAt DateTime?
+  /// Non-null only for an administrator-forced reset (11 — Data model:
+  /// "force-reset flag where needed"). Modeled as "who requested it"
+  /// rather than a bare boolean so the administrator actor is itself
+  /// traceable for audit — engineering proposal; the administrator never
+  /// sees or sets the resulting password/token (11 — Users/permissions).
+  requestedByAdminId String?
+  requestedByAdmin   User?   @relation("PasswordResetRequestedByAdmin", fields: [requestedByAdminId], references: [id], onDelete: SetNull)
+  createdAt  DateTime  @default(now())
+
+  @@map("password_reset_tokens")
+}
+
+/// External (Google OIDC) identity link (14 — Data model). Keyed by
+/// `(provider, providerSubject)`, never by email — 14 — API behavior.
+model ExternalIdentity {
+  id                   String   @id @default(uuid())
+  userId               String
+  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// String, not an enum: a provider value is reference data an operator
+  /// may need to add without a schema migration — engineering proposal.
+  /// Only "google" is required by any read guide today.
+  provider             String
+  providerSubject      String
+  verifiedEmailSnapshot String
+  linkedAt             DateTime @default(now())
+
+  @@unique([provider, providerSubject])
+  @@map("external_identities")
+}
+
+/// Short-lived, single-use OIDC authorization-code+PKCE transaction (14 —
+/// Data model). Never stores the verifier in plaintext at the application
+/// layer per 14's own requirement — this column holds whatever encrypted
+/// form 03.05 produces; the schema only reserves the storage.
+model OidcLoginTransaction {
+  id                     String    @id @default(uuid())
+  stateDigest            String    @unique
+  pkceVerifierEncrypted  String
+  nonce                  String
+  returnPath             String
+  createdAt              DateTime  @default(now())
+  expiresAt              DateTime
+  consumedAt             DateTime?
+
+  @@map("oidc_login_transactions")
+}
+
+// ---------------------------------------------------------------------
+// Session (09 — Data model; 14 reuses the same model)
+// ---------------------------------------------------------------------
+
+/// A single issued session. "Revoke this one session" = set `revokedAt`;
+/// "revoke every session for this account" = bump `User.sessionTokenVersion`
+/// instead (see that field's own comment) — both mechanisms are required
+/// by 09/11's explicit behavior; neither is independently specified in
+/// exact shape, so this split is an engineering proposal.
+model Session {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// The token-version value this session's JWTs were issued under —
+  /// compared against the live `User.sessionTokenVersion` on every
+  /// protected request (09 — API behavior: "revocation/token version").
+  tokenVersion Int     @default(0)
+  createdAt  DateTime  @default(now())
+  expiresAt  DateTime
+  revokedAt  DateTime?
+
+  @@map("sessions")
+}
+
+// ---------------------------------------------------------------------
+// Project (15/16/18/19/20/21 — see contracts.md §3.3)
+// ---------------------------------------------------------------------
+
+model Project {
+  /// Generated here, never from title/short name — 16 — API behavior is
+  /// explicit this UUID is what the Project DB identifier is derived from.
+  id              String                   @id @default(uuid())
+  title           String
+  /// Unique, required, immutable after creation (18/19 — explicit).
+  shortName       String                   @unique
+  description     String?
+
+  /// Immutable creation attribution (18/19 — explicit; role-decision.md
+  /// §3.3/§6). `onDelete: Restrict` — a User row is never hard-deleted
+  /// (13), so this FK is a safety net, not a real operational limitation.
+  createdByUserId String
+  createdBy       User                     @relation("ProjectCreator", fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  provisioningState ProjectProvisioningState @default(PROVISIONING)
+  /// Deduplicates a repeated provisioning command (16 — Data model,
+  /// Acceptance criteria).
+  idempotencyKey        String?              @unique
+  templateReleaseIdentifier String?
+  /// Nullable, no enforced relation to JobRecord's own table (see that
+  /// model's comment) — kept as a plain opaque reference consistent with
+  /// 06's "payloads carry opaque... references" rule, and because a
+  /// provisioning job may be enqueued before — or even without — a
+  /// JobRecord row existing yet in every code path.
+  provisioningJobId     String?
+  provisioningFailureCode    String?
+  provisioningFailureMessage String?
+
+  /// Independent of `provisioningState` — contracts.md §3.3 records the
+  /// relationship between these as unspecified by any source; this schema
+  /// does not assume they are mutually exclusive or sequenced.
+  publishedAt DateTime?
+  archivedAt  DateTime?
+
+  /// External object-storage reference (20 — Data model); the image bytes
+  /// themselves live outside this database.
+  coverImageStorageKey String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  researchQuestions ProjectResearchQuestion[]
+  memberships       Membership[]
+  invitations       Invitation[]
+
+  @@map("projects")
+}
+
+/// Ordered research questions (18 — UI behavior; 21 — Data model: "Research
+/// Questions and their display order"). A relational table with an
+/// explicit `order` column, rather than a JSON array, because 21
+/// explicitly describes backend-managed reordering (move-up/move-down) —
+/// engineering proposal, directly matching that explicit requirement.
+model ProjectResearchQuestion {
+  id          String  @id @default(uuid())
+  projectId   String
+  project     Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  order       Int
+  question    String
+  description String?
+
+  @@unique([projectId, order])
+  @@map("project_research_questions")
+}
+
+// ---------------------------------------------------------------------
+// Membership (15 — Data model; role-decision.md)
+// ---------------------------------------------------------------------
+
+/// See this file's header comment for the three raw-SQL constraints this
+/// model additionally relies on (partial-unique "at most one ACTIVE
+/// membership per (projectId,userId)"; partial-unique "at most one
+/// PROJECT_OWNER per project"). Neither is expressed as `@@unique` here —
+/// a plain composite unique would incorrectly block re-adding a
+/// previously REMOVED member, and Prisma's schema language has no
+/// conditional/partial unique syntax.
+model Membership {
+  id        String           @id @default(uuid())
+  projectId String
+  project   Project          @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  userId    String
+  user      User             @relation("MembershipUser", fields: [userId], references: [id], onDelete: Restrict)
+  role      ProjectRole
+  status    MembershipStatus @default(ACTIVE)
+
+  addedByUserId   String?
+  addedBy         User?    @relation("MembershipAddedBy", fields: [addedByUserId], references: [id], onDelete: SetNull)
+  removedByUserId String?
+  removedBy       User?    @relation("MembershipRemovedBy", fields: [removedByUserId], references: [id], onDelete: SetNull)
+  removedReason   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("memberships")
+}
+
+// ---------------------------------------------------------------------
+// Invitation (15 — Data model, explicit)
+// ---------------------------------------------------------------------
+
+/// See this file's header comment for the partial-unique "at most one
+/// INVITED invitation per (projectId,normalizedEmail)" and the CHECK
+/// constraint forbidding `proposedRole = PROJECT_OWNER`, both added as raw
+/// SQL in the migration rather than here.
+model Invitation {
+  id              String           @id @default(uuid())
+  projectId       String
+  project         Project          @relation(fields: [projectId], references: [id], onDelete: Restrict)
+  normalizedEmail String
+  proposedRole    ProjectRole
+  status          InvitationStatus @default(INVITED)
+  /// Digest only, single-use (15 — API behavior, explicit).
+  tokenHash       String           @unique
+  expiresAt       DateTime
+
+  inviterUserId   String
+  inviter         User             @relation("InvitationInviter", fields: [inviterUserId], references: [id], onDelete: Restrict)
+  acceptedUserId  String?
+  acceptedUser    User?            @relation("InvitationAcceptedBy", fields: [acceptedUserId], references: [id], onDelete: SetNull)
+
+  sentAt     DateTime  @default(now())
+  acceptedAt DateTime?
+
+  @@map("invitations")
+}
+
+// ---------------------------------------------------------------------
+// Draft (18 — Data model/API behavior — project-creation drafts ONLY;
+// never a protocol-revision mechanism, per 21's explicit prohibition and
+// this sub-issue's own "preserve approved role decisions" instruction)
+// ---------------------------------------------------------------------
+
+model ProjectCreationDraft {
+  id              String   @id @default(uuid())
+  ownerUserId     String
+  owner           User     @relation("DraftOwner", fields: [ownerUserId], references: [id], onDelete: Restrict)
+  currentStep     String
+  /// JSONB payload — the same versioned `ProjectCreationDraft` Zod
+  /// contract used for autosave, JSON import, and export (18 — API
+  /// behavior). This schema does not interpret its contents.
+  payload         Json
+  payloadVersion  Int      @default(1)
+  /// Deduplicates the final confirmation command (18 — API behavior).
+  /// Nullable: a draft may never reach confirmation at all.
+  idempotencyKey  String?  @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // No disposition field (deleted/archived/converted) is modeled: no
+  // source states what happens to this row after a successful conversion
+  // to a Project (contracts.md §5.10/§3.6 — an explicitly recorded gap,
+  // not silently resolved by inventing a field here).
+
+  @@map("project_creation_drafts")
+}
+
+// ---------------------------------------------------------------------
+// Job (06 — Data model: application metadata layer ONLY — never
+// pg-boss's/any queue engine's own private tables; no pg-boss/BullMQ
+// choice is made by this model)
+// ---------------------------------------------------------------------
+
+model JobRecord {
+  id        String    @id @default(uuid())
+  /// Job kind/name (06 — API behavior implies feature modules enqueue
+  /// distinct job types through one shared platform).
+  type      String
+  status    JobStatus @default(QUEUED)
+  actorUserId String?
+  actor       User?   @relation("JobRecordActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+  /// Nullable: some jobs are global, not project-scoped (06 — Users and
+  /// permissions distinguishes Application-Administrator-visible "all
+  /// jobs" from Project-Admin-visible "their own project's jobs" — a
+  /// nullable projectId is what makes that distinction meaningful).
+  /// Deliberately NOT a Prisma relation to `Project` (`onDelete` semantics
+  /// for a queue-metadata row should never block or cascade a Project
+  /// mutation) — stored as a plain opaque id per 06's own "payloads carry
+  /// opaque project IDs" rule.
+  projectId         String?
+  progress          Int?
+  safeErrorMessage  String?
+  correlationId     String?
+  /// Opaque references only (06 — Data model) — never a filesystem path
+  /// or credential.
+  resultArtifactReferences Json?
+  /// Deduplicates a repeated logical enqueue request (06 — Acceptance
+  /// criteria, explicit).
+  idempotencyKey    String?   @unique
+  /// Opaque pointer into whichever queue engine actually runs this job —
+  /// deliberately engine-agnostic (no pg-boss/BullMQ column shape is
+  /// assumed; PENDING-DECISIONS item 1 remains unresolved and is not
+  /// decided by this field).
+  queueJobId        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("job_records")
+}
+
+// ---------------------------------------------------------------------
+// Audit (22 — Data model: control-plane AuditEvent ONLY. The
+// project-resource AuditEvent and OperationBatch/CompensatingAction
+// records are explicitly Project-DB-owned per 22's own Data model and
+// contracts.md §3.8/§4 — out of this control schema entirely.)
+// ---------------------------------------------------------------------
+
+/// Append-only by convention: no update/delete is exposed by 03.05's
+/// future repository layer (22 — Definition of Done). This sub-issue adds
+/// no database-level trigger enforcing that — an available, undecided
+/// enhancement, not implemented here (role-decision.md §7, category B
+/// reasoning applies equally to this model; see this sub-issue's
+/// completion report for the explicit choice not to add one now).
+/// 22 — API behavior/Acceptance criteria/Definition of Done all state the
+/// same envelope three times: "actor, scope, project ID when applicable,
+/// action, target, outcome, correlation ID, timestamp, and redacted
+/// metadata." Only `projectId` ever carries a conditional qualifier
+/// ("when applicable") across all three restatements — `target` and
+/// `correlation ID` are listed unconditionally every time. `targetType`/
+/// `targetId`/`correlationId` are therefore REQUIRED below, not nullable
+/// — correcting an earlier drafting error that had mislabeled this
+/// nullability as an explicit source requirement when the source never
+/// actually stated it. `actorUserId` remains nullable: unlike target/
+/// correlationId, no restatement of the envelope rules out a
+/// system-initiated event (e.g. 15 — Jobs behavior's automated invitation
+/// expiry/cleanup has no human actor), and this nullability was not the
+/// finding being corrected here.
+model AuditEvent {
+  id             String   @id @default(uuid())
+  schemaVersion  Int      @default(1)
+  actorUserId    String?
+  actor          User?    @relation("AuditEventActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+  /// Nullable — set when this control-plane event concerns a specific
+  /// project (e.g. "project archived"); null for a purely global action
+  /// (e.g. "application administrator assigned"). Not a Prisma relation to
+  /// `Project`, for the same reason as `JobRecord.projectId` above. This
+  /// is the ONLY field 22 itself ever qualifies as conditional
+  /// ("project ID when applicable").
+  projectId      String?
+  action         String
+  targetType     String
+  targetId       String
+  outcome        String
+  correlationId  String
+  /// Redacted/structured only — never an unbounded raw request payload or
+  /// credential (22 — Data model, explicit).
+  redactedMetadata Json?
+  createdAt      DateTime @default(now())
+
+  @@map("audit_events")
 }

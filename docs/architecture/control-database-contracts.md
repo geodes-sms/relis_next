@@ -568,6 +568,147 @@ and tests the eventual schema/repositories.
       expansion requiring its own justification — this inventory is meant to
       make that check straightforward.
 
+## 8. Schema-readiness data dictionary (closed by 03.04)
+
+Added for [03.04 — Implement versioned Control schema, migrations and
+generated client](../../../context/notion-tasks/sub-issues/03-04.md), which
+required this document to state candidate keys, uniqueness scopes,
+nullability, relationships, and lifecycle/sensitivity for every proposed
+model before implementation. This section is the authoritative trace from
+each requirement in §3 to the actual implemented model in
+[`packages/database/prisma/control/schema.prisma`](../../packages/database/prisma/control/schema.prisma) —
+read that file's own per-field comments for the full rationale; this table
+summarizes and adds the identifier/uniqueness/relationship/sensitivity
+columns §3 did not yet carry. **Status** values: **explicit** (source
+states it directly), **user-approved** (fixed by
+[`control-database-role-decision.md`](control-database-role-decision.md)),
+**engineering proposal** (a reasonable technical choice where the source
+left the representation open — flagged, not silently assumed approved),
+or **unresolved/gap** (deliberately not encoded — see §5 for the
+corresponding gate).
+
+### 8.1 `User` (identity core)
+
+| Field | Requirement / source | Ownership | Identifier / uniqueness | Required / nullable (rationale) | Relationship, cardinality, `onDelete` | Sensitive / lifecycle | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `id` | 15 — Data model | Control DB | PK, immutable | Required | Referenced by every other model below (1:N from `User`) | — | explicit |
+| `username` | 15 — Data model | Control DB | `@unique` | Required | — | — | explicit |
+| `email` | 15 — Data model | Control DB | `@unique` | Required | — | Sensitive (PII) | explicit |
+| `emailVerifiedAt` | 15 — Data model ("email-verification state") | Control DB | — | Nullable = unverified | — | — | engineering proposal (representation: timestamp, not a boolean, chosen so the verification moment is also recorded for free) |
+| `status` (`AccountStatus`) | 15/09/13 — Data model | Control DB | — | Required, default `ACTIVE` | — | Gates login (09); archive/restore (13) | engineering proposal (3-value enum shape; behavior itself is explicit, exact enum is not — see §3.1) |
+| `isApplicationAdministrator` | 13 — Data model | Control DB | — | Required, default `false` | — | Last-active-admin protection is NOT a DB constraint (13 — see §8.9 handoff note) | engineering proposal (boolean, not a separate role table — no source describes more than one elevated global tier) |
+| `passwordHash`/`passwordSalt`/`passwordParamsVersion` | 09 — Data model | Control DB | — | Nullable (a Google-only account may have none, per 14) | — | Sensitive (credential material) — never logged | explicit requirement; nullable is an engineering proposal |
+| `lastLoginAt` | 09 — Data model | Control DB | — | Nullable | — | — | explicit |
+| `sessionTokenVersion` | 09/11 — inferred mechanism | Control DB | — | Required, default `0` | Compared against `Session.tokenVersion` | Bumping this = "revoke every session" | engineering proposal (see §3.2's "inference on mechanism") |
+| `preferredLocale`, `profileImageStorageKey` | 12 — Data model | Control DB (reference); image bytes External | — | Both nullable | — | `profileImageStorageKey` is an opaque reference only (07) | explicit |
+| `pendingEmail`/`pendingEmailTokenHash`/`pendingEmailExpiresAt` | 12 — Data model/API behavior | Control DB | Token digest only | All nullable (no change in progress = all null) | — | Digest only, never plaintext token | explicit requirement; inline-on-User representation and digest/expiry shape are an engineering proposal (§3.1) |
+| `createdAt`/`updatedAt` | 15 — Data model | Control DB | — | Required | — | — | explicit |
+
+**Deletion behavior:** no source describes hard-deleting a `User` row (13:
+archive only) — every inbound FK from another model therefore defaults to
+`Restrict` for business-record relations (Membership, Invitation, Project,
+Draft, audit/job actor-when-required) and `Cascade` only for purely
+ephemeral, operationally-expendable child rows (`Session`,
+`EmailVerificationToken`, `PasswordResetToken` target side,
+`ExternalIdentity`) — engineering proposal, documented per-relation in
+schema.prisma.
+
+### 8.2 `EmailVerificationToken`, `PasswordResetToken`, `ExternalIdentity`, `OidcLoginTransaction`
+
+| Field | Requirement / source | Ownership | Identifier / uniqueness | Required / nullable | Relationship, cardinality, `onDelete` | Sensitive / lifecycle | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `EmailVerificationToken.tokenHash` | 10 — Data model | Control DB | `@unique` | Required | N:1 → User, `Cascade` | Digest only, never plaintext | explicit |
+| `EmailVerificationToken.expiresAt`/`consumedAt`/`retryCount` | 10 — Data model | Control DB | — | `consumedAt` nullable | — | Expiring, single-use (10 — API behavior) | explicit (`retryCount` shape: engineering proposal) |
+| `PasswordResetToken.tokenHash` | 11 — Data model | Control DB | `@unique` | Required | N:1 → User, `Cascade` | Digest only | explicit |
+| `PasswordResetToken.requestedByAdminId` | 11 — Data model ("force-reset flag where needed") | Control DB | — | Nullable (null = self-requested) | N:1 → User, `SetNull` | Administrator never sees/sets the password or token (11) | engineering proposal — represented as "who requested it", not a bare boolean, so the admin actor is itself traceable |
+| `ExternalIdentity.provider` + `providerSubject` | 14 — Data model | Control DB | `@@unique([provider, providerSubject])` | Both required | N:1 → User, `Cascade` | Never looked up by email alone (14) | explicit (composite key); `provider` as `String` not enum is an engineering proposal |
+| `ExternalIdentity.verifiedEmailSnapshot`/`linkedAt` | 14 — Data model | Control DB | — | Required | — | Snapshot only — not kept in sync with `User.email` | explicit |
+| `OidcLoginTransaction.stateDigest` | 14 — Data model | Control DB | `@unique` | Required | None (standalone, short-lived) | Digest only | explicit |
+| `OidcLoginTransaction.pkceVerifierEncrypted`/`nonce`/`returnPath`/`expiresAt`/`consumedAt` | 14 — Data model | Control DB | — | `consumedAt` nullable | — | Verifier "protected/encrypted server-side only" (14) — schema reserves storage, encryption itself is 03.05's concern | explicit |
+
+### 8.3 `Session`
+
+| Field | Requirement / source | Ownership | Identifier / uniqueness | Required / nullable | Relationship, cardinality, `onDelete` | Sensitive / lifecycle | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `id` | 09 — Data model ("session ID") | Control DB | PK | Required | N:1 → User, `Cascade` | Correlates to the JWT's `sessionId` claim (09) | explicit |
+| `tokenVersion` | 09 — API behavior ("revocation/token version") | Control DB | — | Required, default `0` | — | Compared against `User.sessionTokenVersion` at validation time | engineering proposal (§3.2) |
+| `createdAt`/`expiresAt`/`revokedAt` | 09 — Data model | Control DB | — | `revokedAt` nullable | — | `revokedAt` set on logout (single-session revoke) | explicit |
+
+### 8.4 `Project` and `ProjectResearchQuestion`
+
+| Field | Requirement / source | Ownership | Identifier / uniqueness | Required / nullable | Relationship, cardinality, `onDelete` | Sensitive / lifecycle | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `id` | 16/18 — API behavior | Control DB | PK; derives the Project DB identifier (never stored separately — §5.7) | Required | 1:N → Membership/Invitation/ProjectResearchQuestion | Never exposed as a filesystem/DB identifier to the client (16) | explicit |
+| `title`/`description` | 18/19 | Control DB | — | `title` required, `description` nullable | — | — | explicit |
+| `shortName` | 18/19 | Control DB | `@unique` | Required, immutable after creation | — | — | explicit |
+| `createdByUserId` | 18/19 | Control DB | — | Required, immutable | N:1 → User, `Restrict` | Never accepted from the client (18/19) | explicit — ownership-transfer question closed by role-decision.md §3.3 |
+| `provisioningState` | 16/18 | Control DB | — | Required, default `PROVISIONING` | — | — | explicit |
+| `idempotencyKey` | 16 — Data model/Acceptance criteria | Control DB | `@unique` | Nullable (only set while a provisioning request is in flight/recorded) | — | — | explicit |
+| `templateReleaseIdentifier`, `provisioningJobId`, `provisioningFailureCode`/`Message` | 16 — Data model | Control DB | — | All nullable | `provisioningJobId` is a plain opaque id, no Prisma relation (see §8.6) | Failure message must stay "safe"/non-technical (16 — UI behavior) | explicit |
+| `publishedAt`/`archivedAt` | 19 — UI behavior | Control DB | — | Both nullable | — | Relationship to `provisioningState` is unspecified by any source (§3.3) — not assumed mutually exclusive | explicit fields; **unresolved** interaction with provisioning state (§5, unchanged) |
+| `coverImageStorageKey` | 20 — Data model | Control DB (reference); External (bytes) | — | Nullable | — | Opaque reference only | explicit field name; storage-split is an engineering proposal (§3.3) |
+| `createdAt`/`updatedAt` | 19 — Data model | Control DB | — | Required | — | — | explicit |
+| `ProjectResearchQuestion.order`/`question`/`description` | 18/21 | Control DB | `@@unique([projectId, order])` | `description` nullable | N:1 → Project, `Cascade` | Backend-managed order only — no client-editable order field (21) | explicit requirement; relational-table-with-order-column representation is an engineering proposal (§3.3) |
+
+### 8.5 `Membership`
+
+| Field | Requirement / source | Ownership | Identifier / uniqueness | Required / nullable | Relationship, cardinality, `onDelete` | Sensitive / lifecycle | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `projectId`/`userId` | 15 — Data model | Control DB | **At most one ACTIVE row per `(projectId,userId)`** — raw-SQL partial unique index `memberships_active_project_user_key` (NOT a plain `@@unique`, which would block re-adding a REMOVED member) | Both required | N:1 → Project (`Restrict`), N:1 → User (`Restrict`) | — | explicit requirement; partial-index mechanism is user-approved as the correct DB-enforceable reading (role-decision.md §7) |
+| `role` (`ProjectRole`) | 15 — Data model; role-decision.md | Control DB | **At most one `PROJECT_OWNER` row per project** — raw-SQL partial unique index `memberships_single_owner_per_project_key`; **"exactly one, always"** is NOT a constraint — guaranteed only by 03.05's transactional creation (role-decision.md §6/§7) | Required | — | — | **user-approved** (role-decision.md §3.1/§4) |
+| `status` (`MembershipStatus`) | 15/18 | Control DB | — | Required, default `ACTIVE` | `PENDING_PROVISIONING` only ever applies to the `PROJECT_OWNER` row (18) | Owner row never reaches `REMOVED` via any membership endpoint — **not** a DB constraint, an authorization-layer rule 03.05 must enforce (role-decision.md §7, category C) | **user-approved** (role-decision.md §6) |
+| `addedByUserId`/`removedByUserId`/`removedReason` | 15 — Data model | Control DB | — | All nullable | Both N:1 → User, `SetNull` | Audit trail for membership changes | explicit requirement; `SetNull` (rather than `Restrict`) is an engineering proposal — losing the actor reference is judged lower-stakes than blocking an unrelated user's archival |
+| `createdAt`/`updatedAt` | 15 — Data model | Control DB | — | Required | — | — | explicit |
+
+### 8.6 `Invitation`
+
+| Field | Requirement / source | Ownership | Identifier / uniqueness | Required / nullable | Relationship, cardinality, `onDelete` | Sensitive / lifecycle | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `projectId`/`normalizedEmail` | 15 — Data model | Control DB | **At most one `INVITED` row per `(projectId,normalizedEmail)`** — raw-SQL partial unique index `invitations_active_project_email_key` | Both required | N:1 → Project, `Restrict` | — | explicit |
+| `proposedRole` | 15/18; role-decision.md | Control DB | Raw-SQL `CHECK` (`invitations_proposed_role_not_owner_check`) — `PROJECT_OWNER` can never be proposed | Required | — | — | **user-approved** (role-decision.md §3.1/§5 — Owner is never invitation-assignable) |
+| `status` | 15 — Data model | Control DB | — | Required, default `INVITED` | — | — | explicit |
+| `tokenHash`/`expiresAt` | 15 — Data model | Control DB | `tokenHash` `@unique` | Both required | — | Digest only, single-use | explicit field/behavior; the exact expiry duration (7 days vs. 48 hours) is **unresolved** (§5.3) — this column stores whatever value 03.05 computes, independent of that unresolved default |
+| `inviterUserId`/`acceptedUserId` | 15 — Data model | Control DB | — | `inviterUserId` required, `acceptedUserId` nullable | N:1 → User, `Restrict`/`SetNull` respectively | — | explicit |
+| `sentAt`/`acceptedAt` | 15 — Data model | Control DB | — | `acceptedAt` nullable | — | — | explicit |
+
+### 8.7 `ProjectCreationDraft`
+
+| Field | Requirement / source | Ownership | Identifier / uniqueness | Required / nullable | Relationship, cardinality, `onDelete` | Sensitive / lifecycle | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `ownerUserId` | 18 — Data model/Users permissions | Control DB | — | Required | N:1 → User, `Restrict` | Owner-or-audited-admin access only (18) — authorization-layer rule, not a DB constraint | explicit |
+| `currentStep` | 18 — Data model | Control DB | — | Required | — | — | explicit |
+| `payload` (JSONB) | 18 — API behavior | Control DB | — | Required | — | Same versioned `ProjectCreationDraft` Zod contract as autosave/import/export (18) — this schema does not interpret its contents | explicit |
+| `payloadVersion` | 18 — API behavior ("versioned configuration envelope") | Control DB | — | Required, default `1` | — | — | explicit requirement; exact field name/shape is an engineering proposal (§3.6) |
+| `idempotencyKey` | 18 — API behavior | Control DB | `@unique` | Nullable (only set at final confirmation) | — | — | explicit requirement; placement on the Draft row itself (vs. a separate dedup record) is an engineering proposal (§3.6) |
+| (no disposition field) | — | — | — | — | — | — | **unresolved/gap** (§3.6/§5.10) — deliberately not encoded; no source states what happens to this row after conversion |
+| `createdAt`/`updatedAt` | 18 — Data model | Control DB | — | Required | — | — | explicit |
+
+### 8.8 `JobRecord`
+
+| Field | Requirement / source | Ownership | Identifier / uniqueness | Required / nullable | Relationship, cardinality, `onDelete` | Sensitive / lifecycle | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `type`/`status` | 06 — Data model/UI behavior | Control DB | — | Required | — | — | explicit |
+| `actorUserId` | 06 — Data model | Control DB | — | Nullable (system-initiated jobs) | N:1 → User, `SetNull` | Visibility scoping by actor/project (06 — Users/permissions) is authorization-layer, not a DB constraint | explicit |
+| `projectId` | 06 — Data model | Control DB | — | Nullable (global jobs) | **No Prisma relation** — plain opaque id (06: "payloads carry opaque project IDs") | — | explicit requirement; no-FK representation is an engineering proposal matching 06's own wording |
+| `progress`/`safeErrorMessage`/`correlationId`/`resultArtifactReferences` | 06 — Data model | Control DB | — | All nullable | — | Opaque references only — never a filesystem path or credential (06) | explicit |
+| `idempotencyKey` | 06 — Acceptance criteria | Control DB | `@unique` | Nullable | — | — | explicit |
+| `queueJobId` | — (not named by any source) | External (queue engine's own id, referenced opaquely) | — | Nullable | — | — | engineering proposal — does not select pg-boss/BullMQ; a plain opaque pointer regardless of which engine 03.0x eventually adopts |
+| **(pg-boss's own tables)** | 06 — Data model | External (co-located in this physical database, not modeled here) | — | — | — | — | explicit exclusion — this schema never models the queue engine's private tables |
+| **(39/40 export job-backed rows)** | 39/40 — explicit "no job" contract | — (never created) | — | — | — | — | explicit exclusion (§3.7/§5.11) — these two export features never create a `JobRecord` row |
+
+### 8.9 `AuditEvent`
+
+| Field | Requirement / source | Ownership | Identifier / uniqueness | Required / nullable | Relationship, cardinality, `onDelete` | Sensitive / lifecycle | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `schemaVersion` | 22 — Data model | Control DB | — | Required, default `1` | — | — | explicit |
+| `actorUserId` | 22 — API behavior/Acceptance criteria/Definition of Done (envelope: "actor, scope, project ID when applicable, action, target, outcome, correlation ID...") | Control DB | — | Nullable | N:1 → User, `SetNull` | — | **engineering proposal** (corrected label — see note below) — the envelope lists "actor" unconditionally, same as target/correlationId; nullability here is kept anyway because 15's automated invitation-expiry/cleanup (Jobs behavior) has no human actor and no source describes a "system actor" representation, but this is this document's own inference, not a stated exception in 22 itself |
+| `projectId` | 22 — Data model/API behavior ("project ID **when applicable**" — the only field 22 ever qualifies as conditional) | Control DB | — | Nullable (global events) | **No Prisma relation** — same rationale as `JobRecord.projectId` | Scoping Project-Admin search to their own project (22) is authorization-layer | explicit |
+| `action`/`outcome` | 22 — Data model | Control DB | — | Required | — | — | explicit |
+| `targetType`/`targetId`/`correlationId` | 22 — API behavior/Acceptance criteria/Definition of Done (all three restate the envelope identically: "...action, target, outcome, correlation ID, timestamp...", with no conditional qualifier) | Control DB | — | **Required** (corrected — a prior draft of this table mislabeled these as nullable-and-"explicit"; the source never stated that nullability, only `projectId` carries a conditional qualifier) | — | — | **explicit** (now accurately so) |
+| `redactedMetadata` (JSONB) | 22 — Data model | Control DB | — | Nullable | — | Redacted/structured only — never an unbounded raw payload or credential (22, explicit) | explicit |
+| `createdAt` | 22 — Data model | Control DB | — | Required | — | **Append-only by convention** — no update/delete exposed by 03.05's future repository layer; no DB-level trigger enforces this in 03.04 (see role-decision.md §7, category B — an available, undecided enhancement) | explicit requirement; enforcement-mechanism choice (none added yet) is an engineering decision, reported in 03.04's completion report, not silently assumed |
+| **(cross-project correlation record)** | 22 — Data model ("cross-project operation correlation metadata") | — (not modeled) | — | — | — | — | **unresolved/gap** (§3.8/§5.9) — this schema's plain `projectId` field on `AuditEvent` is judged sufficient for control-plane correlation; no separate correlation table is introduced, since the gap's harder half (correlating Project-DB-resident `OperationBatch` rows) remains genuinely unspecified |
+
 ## Acceptance-criteria evidence (for this sub-issue, 03.02)
 
 - **Every listed field/relation has a source or an explicit inference/decision

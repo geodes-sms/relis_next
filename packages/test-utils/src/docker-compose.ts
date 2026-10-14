@@ -183,10 +183,26 @@ export async function composeConfigQuiet(project: ComposeProject, env: ComposeEn
   return runToCompletion("docker", args, { cwd: project.cwd, env: withEnv(env), timeoutMs: 30000 });
 }
 
-/** Stops (without removing) the given services — used to simulate a dependency becoming unavailable mid-run. */
-export async function composeStop(project: ComposeProject, services: string[], options: { timeoutMs?: number } = {}): Promise<SpawnResult> {
+/**
+ * Stops (without removing) the given services — used to simulate a
+ * dependency becoming unavailable mid-run. `options.env`, when given, is
+ * the Compose INTERPOLATION environment (see `composeRun`'s doc comment
+ * for the distinction from a container-level override) — forwarded for
+ * consistency with every other helper below that resolves Compose
+ * configuration; omitted (the default) preserves every existing caller's
+ * behavior unchanged.
+ */
+export async function composeStop(
+  project: ComposeProject,
+  services: string[],
+  options: { timeoutMs?: number; env?: ComposeEnv } = {},
+): Promise<SpawnResult> {
   const args = composeArgs(project, ["stop", ...services]);
-  return runToCompletion("docker", args, { cwd: project.cwd, timeoutMs: options.timeoutMs ?? 30000 });
+  return runToCompletion("docker", args, {
+    cwd: project.cwd,
+    env: options.env ? withEnv(options.env) : process.env,
+    timeoutMs: options.timeoutMs ?? 30000,
+  });
 }
 
 export async function composeExec(
@@ -216,12 +232,46 @@ export async function composeExec(
  * stream a diagnostic was written to (e.g. a ConfigValidationError,
  * logged via console.error to stderr — see config-validation.test.ts)
  * require them to stay separate.
+ *
+ * TWO DISTINCT environments are in play here, and this function must not
+ * conflate them:
+ *   - `env` (this parameter) becomes `-e KEY=VALUE` flags, which set/
+ *     override variables INSIDE the one-off container `run` creates —
+ *     AFTER Compose has already resolved the service's own config. This
+ *     is what lets a caller simulate "this one container sees a missing
+ *     or invalid value" without touching anything else.
+ *   - `options.composeEnv` is the COMPOSE INTERPOLATION environment —
+ *     what the `docker compose` CLI subprocess itself sees, which is what
+ *     Compose uses to resolve `${VAR}`/`${VAR:-default}` substitutions
+ *     when it builds the target service's config in the first place
+ *     (e.g. `migrate-control`'s own `CONTROL_DATABASE_URL:
+ *     postgresql://${POSTGRES_USER:-relis}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/${POSTGRES_DB:-relis_control}`).
+ *     Previously this function passed no explicit env to that subprocess
+ *     at all, so this interpolation silently fell back to whatever
+ *     ambient/default `POSTGRES_*` values happened to be present —
+ *     independent of, and potentially DIFFERENT from, the values a
+ *     caller used to actually provision PostgreSQL (e.g. via
+ *     `composeUp`), producing a baked-in `CONTROL_DATABASE_URL` with the
+ *     WRONG credentials/database name even though the right ones were
+ *     passed as `-e` overrides.
+ *
+ * When `options.composeEnv` is omitted, `env` is reused for the
+ * interpolation environment too — this preserves every existing caller's
+ * behavior unchanged (none of them reference a host-interpolated Compose
+ * variable through `env` today; they only set container-level overrides
+ * that are not themselves `${...}`-substituted anywhere in
+ * docker-compose.yml). Callers that provision PostgreSQL with explicit
+ * `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`/`PROJECT_TEST_DB_NAME`
+ * values (as `composeUp` was already called with) MUST pass the SAME
+ * object as `options.composeEnv` here too, or the service's own
+ * interpolated config will silently diverge from what was actually
+ * provisioned.
  */
 export async function composeRun(
   project: ComposeProject,
   service: string,
   env: ComposeEnv,
-  options: { timeoutMs?: number; command?: string[] } = {},
+  options: { timeoutMs?: number; command?: string[]; composeEnv?: ComposeEnv } = {},
 ): Promise<SpawnResult> {
   const args = composeArgs(project, ["run", "--rm", "--no-deps", "-T"]);
   for (const [key, value] of Object.entries(env)) {
@@ -229,13 +279,24 @@ export async function composeRun(
   }
   args.push(service);
   if (options.command) args.push(...options.command);
-  return runToCompletion("docker", args, { cwd: project.cwd, timeoutMs: options.timeoutMs ?? 60000 });
+  return runToCompletion("docker", args, {
+    cwd: project.cwd,
+    env: withEnv(options.composeEnv ?? env),
+    timeoutMs: options.timeoutMs ?? 60000,
+  });
 }
 
 /** Queries the actual host-assigned port for a published container port (works with `0` / ephemeral bindings too). */
-export async function composePort(project: ComposeProject, service: string, containerPort: number): Promise<number> {
+/** `options.env` — see `composeStop`'s doc comment for the distinction and the omitted-default behavior. */
+export async function composePort(
+  project: ComposeProject,
+  service: string,
+  containerPort: number,
+  options: { env?: ComposeEnv } = {},
+): Promise<number> {
   const result = await runToCompletion("docker", composeArgs(project, ["port", service, String(containerPort)]), {
     cwd: project.cwd,
+    env: options.env ? withEnv(options.env) : process.env,
     timeoutMs: 15000,
   });
   const match = /:(\d+)\s*$/.exec(result.stdout.trim());
@@ -245,15 +306,37 @@ export async function composePort(project: ComposeProject, service: string, cont
   return Number(match[1]);
 }
 
-export async function composeLogs(project: ComposeProject, service: string, options: { timeoutMs?: number } = {}): Promise<SpawnResult> {
+/** `options.env` — see `composeStop`'s doc comment for the distinction and the omitted-default behavior. */
+export async function composeLogs(
+  project: ComposeProject,
+  service: string,
+  options: { timeoutMs?: number; env?: ComposeEnv } = {},
+): Promise<SpawnResult> {
   const args = composeArgs(project, ["logs", "--no-color", service]);
-  return runToCompletion("docker", args, { cwd: project.cwd, timeoutMs: options.timeoutMs ?? 15000 });
+  return runToCompletion("docker", args, {
+    cwd: project.cwd,
+    env: options.env ? withEnv(options.env) : process.env,
+    timeoutMs: options.timeoutMs ?? 15000,
+  });
 }
 
-/** The container id for `service` (its most recent one, including already-exited containers via `-a`), or `undefined` if none exists yet. */
-export async function getContainerId(project: ComposeProject, service: string): Promise<string | undefined> {
+/**
+ * The container id for `service` (its most recent one, including
+ * already-exited containers via `-a`), or `undefined` if none exists yet.
+ * `options.env` — see `composeStop`'s doc comment for the distinction and
+ * the omitted-default behavior; this is a `docker compose` subcommand
+ * (unlike the plain `docker inspect` calls below that consume its
+ * result), so it is the one place in this id/status/exit-code chain that
+ * can actually resolve Compose configuration.
+ */
+export async function getContainerId(
+  project: ComposeProject,
+  service: string,
+  options: { env?: ComposeEnv } = {},
+): Promise<string | undefined> {
   const result = await runToCompletion("docker", composeArgs(project, ["ps", "-a", "-q", service]), {
     cwd: project.cwd,
+    env: options.env ? withEnv(options.env) : process.env,
     timeoutMs: 15000,
   });
   const id = result.stdout.trim().split("\n")[0]?.trim();
@@ -266,9 +349,15 @@ export async function getContainerId(project: ComposeProject, service: string): 
  * `waitForHealthy` for that). Used to confirm actual process liveness for
  * a service with no healthcheck (e.g. `worker`, which has none — see
  * docker-compose.yml's comment on why).
+ *
+ * `options.env` is forwarded only to the `getContainerId` lookup above —
+ * the subsequent `docker inspect <containerId>` call addresses an
+ * already-resolved container by its real id directly (not through
+ * `docker compose`/`composeArgs` at all), so it has no Compose
+ * configuration left to resolve and needs no environment of its own.
  */
-export async function getContainerStatus(project: ComposeProject, service: string): Promise<string> {
-  const containerId = await getContainerId(project, service);
+export async function getContainerStatus(project: ComposeProject, service: string, options: { env?: ComposeEnv } = {}): Promise<string> {
+  const containerId = await getContainerId(project, service, options);
   if (!containerId) {
     throw new Error(`No container found for service "${service}" in project ${project.projectName}`);
   }
@@ -285,10 +374,25 @@ export async function getContainerStatus(project: ComposeProject, service: strin
  * which creates databases independently of migrate-control/migrate-project
  * ever running at all).
  */
-export async function waitForExitCode(project: ComposeProject, service: string, timeoutMs = 120000): Promise<number> {
+/**
+ * `timeoutMs` accepts either a plain number (every existing caller's
+ * current shape, unchanged) or `{ timeoutMs?, env? }` — `options.env` is
+ * the Compose interpolation environment forwarded to the internal
+ * `getContainerId` lookup (see `composeStop`'s doc comment for the
+ * distinction); the `docker inspect` call that follows addresses an
+ * already-resolved container id directly and needs no environment of its
+ * own, exactly as in `getContainerStatus` above.
+ */
+export async function waitForExitCode(
+  project: ComposeProject,
+  service: string,
+  timeoutMs: number | { timeoutMs?: number; env?: ComposeEnv } = 120000,
+): Promise<number> {
+  const options = typeof timeoutMs === "number" ? { timeoutMs } : timeoutMs;
+  const effectiveTimeoutMs = options.timeoutMs ?? 120000;
   const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const containerId = await getContainerId(project, service);
+  while (Date.now() - start < effectiveTimeoutMs) {
+    const containerId = await getContainerId(project, service, { env: options.env });
     if (containerId) {
       const inspect = await runToCompletion(
         "docker",
@@ -302,7 +406,7 @@ export async function waitForExitCode(project: ComposeProject, service: string, 
     }
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 1000));
   }
-  throw new Error(`Timed out after ${timeoutMs}ms waiting for service "${service}" to exit in project ${project.projectName}`);
+  throw new Error(`Timed out after ${effectiveTimeoutMs}ms waiting for service "${service}" to exit in project ${project.projectName}`);
 }
 
 /**
@@ -405,11 +509,26 @@ export async function waitForHttpStatus(
  * fabricates readiness for a service with no healthcheck (e.g.
  * apps/worker, which has none — see docker-compose.yml's comment on why).
  */
-export async function waitForHealthy(project: ComposeProject, service: string, timeoutMs = 120000): Promise<void> {
+/**
+ * `timeoutMs` accepts either a plain number (every existing caller's
+ * current shape, unchanged) or `{ timeoutMs?, env? }` — `options.env` is
+ * the Compose interpolation environment this `docker compose ps`
+ * subcommand uses to resolve configuration (see `composeStop`'s doc
+ * comment for the full distinction); omitted preserves today's ambient
+ * behavior exactly.
+ */
+export async function waitForHealthy(
+  project: ComposeProject,
+  service: string,
+  timeoutMs: number | { timeoutMs?: number; env?: ComposeEnv } = 120000,
+): Promise<void> {
+  const options = typeof timeoutMs === "number" ? { timeoutMs } : timeoutMs;
+  const effectiveTimeoutMs = options.timeoutMs ?? 120000;
   const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
+  while (Date.now() - start < effectiveTimeoutMs) {
     const result = await runToCompletion("docker", composeArgs(project, ["ps", service]), {
       cwd: project.cwd,
+      env: options.env ? withEnv(options.env) : process.env,
       timeoutMs: 15000,
     });
     const serviceLine = result.stdout.split("\n").find((line) => line.includes(service));
@@ -419,7 +538,7 @@ export async function waitForHealthy(project: ComposeProject, service: string, t
     }
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 1000));
   }
-  throw new Error(`Timed out after ${timeoutMs}ms waiting for service "${service}" to become healthy in project ${project.projectName}`);
+  throw new Error(`Timed out after ${effectiveTimeoutMs}ms waiting for service "${service}" to become healthy in project ${project.projectName}`);
 }
 
 /**
@@ -430,9 +549,18 @@ export async function waitForHealthy(project: ComposeProject, service: string, t
  * a persistence check that needs to prove "the SAME container came
  * back" must use this one.
  */
-export async function composeStart(project: ComposeProject, services: string[], options: { timeoutMs?: number } = {}): Promise<SpawnResult> {
+/** `options.env` — see `composeStop`'s doc comment for the distinction and the omitted-default behavior. */
+export async function composeStart(
+  project: ComposeProject,
+  services: string[],
+  options: { timeoutMs?: number; env?: ComposeEnv } = {},
+): Promise<SpawnResult> {
   const args = composeArgs(project, ["start", ...services]);
-  return runToCompletion("docker", args, { cwd: project.cwd, timeoutMs: options.timeoutMs ?? 120000 });
+  return runToCompletion("docker", args, {
+    cwd: project.cwd,
+    env: options.env ? withEnv(options.env) : process.env,
+    timeoutMs: options.timeoutMs ?? 120000,
+  });
 }
 
 /**
