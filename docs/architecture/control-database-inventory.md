@@ -4,6 +4,21 @@ Local sub-issue: [03.01 — Locate @relis/database in the target
 repository](../../../context/notion-tasks/sub-issues/03-01.md), under parent
 [03 — Create control Prisma schema](../../../context/notion-tasks/03-control-prisma.md).
 
+> **Superseded for schema content by 03.04.** This document records the
+> genuinely **model-free** baseline as it stood for sub-issues 03.01–03.03
+> (zero models, zero migrations in `packages/database/prisma/control/`).
+> [03.04 — Implement versioned Control schema, migrations and generated
+> client](../../../context/notion-tasks/sub-issues/03-04.md) has since
+> implemented the approved schema, a committed migration, and a generated
+> Control client on top of this same baseline. Everything below about the
+> package/workspace/configuration/Compose integration and existing test
+> baseline remains accurate; only §3 ("zero models, zero enums, no
+> generator block") and §8's "no control-plane entities are modeled" item
+> are historical, not current — see
+> [`control-database-contracts.md`](control-database-contracts.md) §8 for
+> the current per-model data dictionary and 03.04's own completion report
+> for the implemented schema.
+
 ## 1. Scope and verification method
 
 This document is a bounded inspection deliverable for sub-issue 03.01 only.

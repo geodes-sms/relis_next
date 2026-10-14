@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "migrate": "tsx src/migrate.ts"
+    "migrate": "tsx src/migrate.ts",
+    "generate:control": "prisma generate --config prisma/control/prisma.config.ts",
+    "smoke:control": "tsx scripts/control-client-smoke.mts"
   },
   "dependencies": {
     "@prisma/adapter-pg": "^7.9.0",

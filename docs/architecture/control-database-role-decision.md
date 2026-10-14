@@ -499,3 +499,34 @@ open (see that file's own updated text for the exact wording):
 §5.4 (who may create a project), §5.3/§5.8 (invitation expiry), §5.6 (21's
 revision-job self-contradiction), §5.7, §5.9, §5.10, §5.11, §5.12 are
 **unaffected** and remain exactly as recorded there.
+
+## 11. Migration-compatibility clarification (added for 03.04)
+
+[03.04 — Implement versioned Control schema, migrations and generated
+client](../../../context/notion-tasks/sub-issues/03-04.md) requires this
+record to state whether any business model, persisted role enum, or
+committed migration already existed before this decision's role model was
+encoded into a real schema — because if one had, `PROJECT_ADMIN` →
+`PROJECT_OWNER` would have been a real **data migration** (rewriting
+existing enum values in existing rows), not merely a naming choice.
+
+**Inspected at the start of 03.04, before any schema file was written:**
+`packages/database/prisma/control/schema.prisma` contained only a bare
+`datasource db { provider = "postgresql" }` block — zero models, zero
+enums — and `packages/database/prisma/control/migrations/` did not exist
+at all (confirmed by directory listing; this matches the 03.01 baseline
+inventory and was independently reconfirmed, not merely assumed, before
+03.04 touched anything).
+
+**Conclusion:** the baseline was genuinely model-free. `PROJECT_OWNER` was
+therefore written directly into the schema and its one committed migration
+from the start — `PROJECT_ADMIN` was never created as a persisted enum
+value, never stored in any row, and never renamed by a migration. This
+decision's role-model resolution (§3.1) is exactly the "terminology/design
+resolution, not a data migration" case this sub-issue anticipated; no
+migration in `packages/database/prisma/control/migrations/` contains an
+enum-rename, a data backfill, or any reference to `PROJECT_ADMIN` as a
+stored value. See
+[`control-database-inventory.md`](control-database-inventory.md) and
+03.04's own completion report for the implemented schema this conclusion
+applies to.

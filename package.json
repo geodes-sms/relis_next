@@ -9,8 +9,9 @@
     "lint": "pnpm -r lint",
     "typecheck": "pnpm -r typecheck && pnpm run typecheck:tests",
     "typecheck:tests": "pnpm --filter @relis/config build && tsc --noEmit -p tsconfig.tests.json",
-    "test": "pnpm -r test && pnpm run test:integration",
+    "test": "pnpm -r test && pnpm run test:integration && pnpm run test:migration",
     "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:migration": "vitest run --config vitest.migration.config.ts",
     "test:e2e": "playwright test"
   },
   "packageManager": "pnpm@11.17.0",
