@@ -8,9 +8,9 @@
     "build": "pnpm -r build",
     "lint": "pnpm -r lint",
     "typecheck": "pnpm -r typecheck && pnpm run typecheck:tests",
-    "typecheck:tests": "pnpm --filter @relis/config build && tsc --noEmit -p tsconfig.tests.json",
+    "typecheck:tests": "pnpm --filter @relis/config build && pnpm --filter @relis/database run generate:control && tsc --noEmit -p tsconfig.tests.json",
     "test": "pnpm -r test && pnpm run test:integration && pnpm run test:migration",
-    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:integration": "pnpm --filter @relis/config build && pnpm --filter @relis/database run generate:control && vitest run --config vitest.integration.config.ts",
     "test:migration": "vitest run --config vitest.migration.config.ts",
     "test:e2e": "playwright test"
   },
@@ -21,6 +21,7 @@
   "devDependencies": {
     "@playwright/test": "^1.63.0",
     "@relis/config": "workspace:*",
+    "@relis/database": "workspace:*",
     "@relis/test-utils": "workspace:*",
     "@types/node": "^26.1.1",
     "typescript": "^7.0.2",
