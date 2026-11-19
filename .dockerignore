@@ -1,0 +1,21 @@
+# Keeps the Docker build context small and forces every image to produce
+# its own node_modules/dist inside the build (pnpm install + the
+# @relis/config build step), instead of accidentally baking in whatever
+# happens to exist on the host checkout. See
+# docs/architecture/docker-compose-stack.md.
+
+node_modules
+**/node_modules
+.next
+**/.next
+dist
+**/dist
+coverage
+**/coverage
+.git
+.vscode
+*.log
+
+.env
+.env.*
+!.env.example

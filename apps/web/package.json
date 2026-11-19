@@ -3,12 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
+    "dev": "node ./scripts/run.mjs dev",
+    "build": "pnpm --filter @relis/config build && node ./scripts/run.mjs build",
+    "start": "node ./scripts/run.mjs start",
     "lint": "eslint"
   },
   "dependencies": {
+    "@relis/config": "workspace:*",
     "next": "16.2.11",
     "react": "19.2.4",
     "react-dom": "19.2.4"

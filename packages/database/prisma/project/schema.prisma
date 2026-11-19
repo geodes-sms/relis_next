@@ -1,0 +1,8 @@
+// Schema applied to every isolated per-project database. No models are
+// defined yet: no project-data domain has been authorized for
+// implementation. This schema exists only so the Prisma CLI has a valid
+// target for the migration entry point (packages/database/src/migrate.ts)
+// to validate configuration against and invoke `prisma migrate deploy` on.
+datasource db {
+  provider = "postgresql"
+}

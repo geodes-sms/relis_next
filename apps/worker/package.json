@@ -5,12 +5,13 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/main.ts",
-    "build": "tsc",
+    "build": "pnpm --filter @relis/config build && tsc",
     "start": "node dist/main.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
+    "@relis/config": "workspace:*",
     "dotenv": "^17.4.2",
     "pg-boss": "^12.26.3",
     "zod": "^4.4.3"

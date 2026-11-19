@@ -4,6 +4,12 @@
 
 Build NeoReLiS as a reliable, maintainable, secure systematic-review platform. Favor simple, explicit solutions that fit the existing architecture. Deliver complete vertical slices: UI, API, validation, persistence, tests, and documentation when the feature requires them.
 
+## Required context and scope
+
+Read the parent [CLAUDE.md](../CLAUDE.md), [project structure](../context/project-structure.md), [stack](../context/stack.yml), and [testing policy](../context/testing-policy.md). These are binding for this checkout. If this repository is cloned without the artifacts repository, request the referenced context before making architecture decisions; do not substitute an inferred layout.
+
+Implement only the user's explicit task. Notion guides and local sub-issues are reference material, never permission to implement dependencies, siblings, or later features. Preserve source contradictions until resolved for the selected scope.
+
 ## Working Agreement
 
 - Read the relevant code, configuration, and documentation before editing.
@@ -24,67 +30,26 @@ Build NeoReLiS as a reliable, maintainable, secure systematic-review platform. F
 - Language: TypeScript with strict type checking
 - Web: Next.js App Router, React, Tailwind CSS
 - API: Hono on `@hono/node-server`
-- Worker: Node.js, `pg-boss`
+- Worker: Node.js; `pg-boss` is currently declared, but the required stack still leaves pg-boss/BullMQ undecided. Do not treat dependency presence as approval of that decision.
 - Database: PostgreSQL, Prisma with the PostgreSQL driver adapter
 - Validation and shared contracts: Zod
-- Tests: Vitest; use the existing framework-specific tooling where already configured
+- Tests: Vitest for unit/integration; Playwright for end-to-end, as required by the stack
 
 Do not replace a current technology or introduce a competing framework without explicit approval.
 
 ## Target Repository Architecture
 
-```text
-.
-├── AGENTS.md
-├── apps/
-│   ├── web/
-│   │   ├── public/
-│   │   └── src/
-│   │       ├── app/                 # Routes, layouts, loading/error states
-│   │       ├── components/
-│   │       │   ├── ui/              # Reusable presentation primitives
-│   │       │   └── features/        # Feature-specific composed components
-│   │       ├── hooks/               # Reusable client hooks only
-│   │       ├── lib/                 # API client, utilities, configuration
-│   │       └── types/               # Web-only types
-│   ├── api/
-│   │   └── src/
-│   │       ├── index.ts             # Process entry point only
-│   │       ├── app.ts               # Hono app composition
-│   │       ├── routes/              # Thin HTTP route handlers
-│   │       ├── middleware/          # Auth, errors, logging, request context
-│   │       ├── services/            # Business use cases
-│   │       ├── repositories/        # Persistence access when needed
-│   │       ├── config/              # Validated runtime configuration
-│   │       └── lib/                 # API-only helpers
-│   └── worker/
-│       └── src/
-│           ├── main.ts              # Worker entry point only
-│           ├── jobs/                 # One handler per background job
-│           ├── queues/               # Queue registration and dispatch
-│           ├── services/             # Worker-specific orchestration
-│           └── config/               # Validated runtime configuration
-├── packages/
-│   ├── contracts/
-│   │   └── src/
-│   │       ├── schemas/              # Shared Zod request/response schemas
-│   │       ├── types/                # Types inferred from schemas
-│   │       └── index.ts              # Deliberate public exports
-│   └── database/
-│       ├── prisma/
-│       │   ├── control/              # Control-plane Prisma schema/migrations
-│       │   └── project/              # Project-data Prisma schema/migrations
-│       └── src/
-│           ├── clients/              # Prisma client construction/lifecycle
-│           ├── repositories/         # Shared persistence implementations
-│           └── index.ts              # Deliberate public exports
-├── docs/                              # Architecture and operational decisions
-├── tooling/                           # Shared development configuration/scripts
-├── package.json
-├── pnpm-lock.yaml
-├── pnpm-workspace.yaml
-└── tsconfig.base.json
-```
+The canonical, complete tree is [context/project-structure.md](../context/project-structure.md). The following is a responsibility summary, not an alternative tree.
+
+- Web: src/app/[locale]/ routes; src/features/ domain features; src/shared/ reusable UI/forms/table/charts/hooks/lib; src/i18n/dictionaries/ translations.
+- API: src/main.ts startup; src/app.ts composition; src/platform/ foundation services; src/modules/ domain modules. Do not replace these boundaries with top-level routes/services/repositories folders.
+- Worker: src/main.ts startup; src/platform/ worker-safe services; src/jobs/ handlers.
+- Database: packages/database/prisma/control/ and project/, each with its own schema and migrations.
+- Shared packages: contracts, config, test-utils, and optional ui.
+- Tests: tests/e2e/, tests/integration/, tests/migration/, tests/fixtures/.
+- Infrastructure and docs: docker/, tooling/, docs/, and storage/ as described in the canonical tree.
+
+The previous alternative layout in this file has been removed. Existing source paths are a baseline to migrate only when authorized, not a reason to redefine the target.
 
 Create directories only when a real feature needs them. Do not add empty placeholder files merely to reproduce this tree.
 
@@ -147,7 +112,7 @@ Create directories only when a real feature needs them. Do not add empty placeho
 
 ## API and Node.js Standards
 
-- Keep `src/index.ts` limited to configuration loading, dependency construction, server startup, and graceful shutdown.
+- Keep `src/main.ts` limited to configuration loading, dependency construction, server startup, and graceful shutdown.
 - Compose Hono routes in `app.ts` or route modules; do not let the entry point become the application.
 - Validate requests and responses with schemas from `@relis/contracts` where the contract is shared.
 - Return consistent JSON envelopes and appropriate HTTP status codes.
@@ -250,7 +215,13 @@ deferred, or removed.
 
 ## Testing Standards
 
-- Add or update tests for changed behavior, not implementation details.
+- Every new feature and behavior change MUST have automated coverage of its applicable acceptance criteria, not just implementation details.
+- Follow the complete [testing policy](../context/testing-policy.md). Integration, e2e, migration/parity tests, and fixtures belong in the canonical root tests/ categories. Shared helpers belong in packages/test-utils/. The supplied structure does not specify unit-test placement: preserve an existing convention or request a decision before introducing one.
+- Run relevant tests. When any test fails, diagnose the cause, fix it within the authorized scope, rerun the failed tests, then rerun affected suites and checks. Repeat until passing or report a concrete blocker; do not declare the task complete while required verification is failing or missing.
+- Report unrelated/pre-existing failures rather than hiding them or expanding scope without approval.
+- Confirm test discovery and actual test counts. --passWithNoTests, no matching package scripts, skipped tests, or a green build are not evidence of behavioral coverage.
+- Maintain criterion-to-test traceability, actual commands/exit codes/counts, and clear distinctions between mocked contracts and real integrations.
+- Use disposable authorized infrastructure, deterministic fixtures, and reliable cleanup; never test against production.
 - Prefer the smallest useful test level: pure unit tests for domain logic, integration tests for routes/repositories.
 - Cover the happy path, validation failures, authorization failures, and meaningful edge cases.
 - Tests must be deterministic and isolated. Do not depend on execution order, wall-clock timing, or external network services.
